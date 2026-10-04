@@ -1,3 +1,4 @@
+import { isIP } from "node:net";
 import { mergeDeep } from "openclaw/plugin-sdk/plugin-config-runtime";
 import { REALTIME_VOICE_AGENT_CONSULT_TOOL_POLICIES } from "openclaw/plugin-sdk/realtime-voice";
 import { normalizeAgentId, parseAgentSessionKey } from "openclaw/plugin-sdk/routing";
@@ -30,20 +31,9 @@ const SecretInputSchema = buildSecretInputSchema();
 
 const LiveKitConfigSchema = z
   .object({
-    url: z
-      .string()
-      .url()
-      .refine((value) => {
-        const url = URL.parse(value);
-        return (
-          url !== null &&
-          url.protocol === "wss:" &&
-          !url.username &&
-          !url.password &&
-          !url.search &&
-          !url.hash
-        );
-      }, "LiveKit requires a wss:// server URL without embedded credentials or tokens"),
+    url: z.string().url(),
+    /** Opt in only for trusted private networks; WS and SDK HTTP traffic are unencrypted. */
+    allowInsecureWs: z.boolean().default(false),
     apiKey: SecretInputSchema.optional(),
     apiSecret: SecretInputSchema.optional(),
     outboundTrunkId: z.string().min(1),
@@ -53,7 +43,29 @@ const LiveKitConfigSchema = z
       .regex(/^[a-zA-Z0-9_-]{1,40}$/)
       .default("openclaw-call-"),
   })
-  .strict();
+  .strict()
+  .refine(
+    ({ url: value, allowInsecureWs }) => {
+      const url = URL.parse(value);
+      if (!url || url.username || url.password || url.search || url.hash) return false;
+      if (url.protocol === "wss:") return true;
+      if (url.protocol !== "ws:" || !allowInsecureWs) return false;
+      // Literal addresses only: never rely on DNS resolution for this opt-in boundary.
+      const host = url.hostname.replace(/^\[|\]$/g, "");
+      if (isIP(host) === 4) {
+        const [a, b] = host.split(".").map(Number);
+        return (
+          a === 127 || a === 10 || (a === 172 && b! >= 16 && b! <= 31) || (a === 192 && b === 168)
+        );
+      }
+      return isIP(host) === 6 && (host === "::1" || /^f[cd]/i.test(host));
+    },
+    {
+      path: ["url"],
+      message:
+        "LiveKit requires wss://, or allowInsecureWs with ws:// to a loopback/private literal IP; credentials, query strings, and fragments are forbidden",
+    },
+  );
 export type LiveKitConfig = z.infer<typeof LiveKitConfigSchema>;
 
 const TelnyxConfigSchema = z

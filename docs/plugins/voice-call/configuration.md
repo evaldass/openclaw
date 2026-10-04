@@ -10,6 +10,48 @@ sidebarTitle: "Configuration"
 
 Plugin config keys, the call owner, the full config reference table, and session scope. Part of the [Voice call plugin](/plugins/voice-call) guide.
 
+## LiveKit server transport
+
+LiveKit uses `wss://` by default. Configure `livekit.url`, `apiKey`, `apiSecret`,
+`outboundTrunkId`, and `inboundTrunkIds`, and enable `realtime.enabled`.
+Credentials support SecretRefs. SDK room/SIP API requests use HTTPS for WSS
+servers, while the native RTC connection keeps the WSS URL.
+
+For an explicitly trusted internal network only, opt in to unencrypted WS:
+
+```json5 validate=false
+{
+  provider: "livekit",
+  inboundPolicy: "disabled", // outbound-only; no public webhook required
+  livekit: {
+    url: "ws://192.168.1.10:7880",
+    allowInsecureWs: true, // default: false
+    apiKey: { source: "env", provider: "default", id: "LIVEKIT_API_KEY" },
+    apiSecret: { source: "env", provider: "default", id: "LIVEKIT_API_SECRET" },
+    outboundTrunkId: "ST_OUTBOUND_TRUNK",
+    inboundTrunkIds: ["ST_INBOUND_TRUNK"],
+  },
+  realtime: { enabled: true },
+}
+```
+
+<Warning>
+`allowInsecureWs` exposes signaling, bearer tokens, and SDK HTTP API traffic to
+network observers and active attackers. A private IP does not make the network
+trusted. Enable it only on an isolated network you control, never over the public
+internet. Migrate to `wss://` and remove the opt-in when TLS is available.
+</Warning>
+
+With the opt-in, `ws://` accepts only literal loopback or private IPs:
+IPv4 `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`,
+and IPv6 `::1` or `fc00::/7`. DNS hostnames (including `localhost`), public,
+unspecified, link-local, and IPv4-mapped IPv6 addresses are rejected. SDK API
+requests use HTTP for WS servers; RTC uses the configured WS URL. Embedded
+credentials, query strings, and URL fragments remain forbidden for both schemes.
+Webhook signature verification remains mandatory. Inbound calls still require
+signed LiveKit webhooks; this transport option does not bypass caller policies,
+trunk selection, or room authorization.
+
 ## Configuration
 
 If `enabled: true` but the selected provider is missing credentials, Gateway
