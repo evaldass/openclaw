@@ -26,6 +26,8 @@ import {
   registerTestManagerCleanup,
   FakeProvider,
 } from "../manager.test-harness.js";
+import { resolveVoiceCallRealtimeTools } from "../realtime-call-control.js";
+import { DEFAULT_VOICE_CALL_REALTIME_INSTRUCTIONS } from "../realtime-defaults.js";
 import type { CallRecord, WebhookContext } from "../types.js";
 import { RealtimeCallHandler } from "../webhook/realtime-handler.js";
 import {
@@ -103,7 +105,11 @@ function context(event: WebhookEvent): WebhookContext {
   };
 }
 
-async function harness(policy: "open" | "allowlist" = "open", server = livekit) {
+async function harness(
+  policy: "open" | "allowlist" = "open",
+  server = livekit,
+  handlesAgentConsult = true,
+) {
   let participants: Array<{ identity: string; sid: string; kind: number }> = [
     { identity: "sip-inbound", sid: "PA_in", kind: 3 },
   ];
@@ -154,18 +160,21 @@ async function harness(policy: "open" | "allowlist" = "open", server = livekit) 
   const createModelBridge = vi.fn<RealtimeVoiceProviderPlugin["createBridge"]>(() => bridge);
   const realtime = makeRealtimeProvider(createModelBridge);
   const handler = new RealtimeCallHandler(
-    config.realtime,
+    {
+      ...config.realtime,
+      tools: resolveVoiceCallRealtimeTools(config.realtime.toolPolicy, config.realtime.tools),
+    },
     manager,
     () => ({
       agentId: "main",
       provider: realtime,
       providerConfig: {},
-      instructions: "Test",
+      instructions: config.realtime.instructions,
       capabilities: {
         transports: ["gateway-relay"],
         inputAudioFormats: [REALTIME_VOICE_AUDIO_FORMAT_G711_ULAW_8KHZ],
         outputAudioFormats: [REALTIME_VOICE_AUDIO_FORMAT_G711_ULAW_8KHZ],
-        handlesAgentConsult: true,
+        handlesAgentConsult,
       },
     }),
     config.serve.path,
@@ -248,6 +257,10 @@ describe("LiveKit telephony lifecycle", () => {
     binding!.sendAudio(Buffer.from([255, 255, 255]));
     expect(h.bridge.sendAudio).toHaveBeenCalledWith(Buffer.from([255, 255, 255]));
     const options = h.createModelBridge.mock.calls[0]![0];
+    expect(options.instructions).toBe(
+      `${DEFAULT_VOICE_CALL_REALTIME_INSTRUCTIONS}\n\nUse native agent delegation for OpenClaw work. End-call and custom realtime function tools are unavailable in this session; the caller can hang up to end the call.`,
+    );
+    expect(options.tools).toEqual([]);
     expect(options.runAgentConsult).toBeTypeOf("function");
     await expect(
       options.runAgentConsult!({ prompt: "Check the caller's request" }),
@@ -258,6 +271,40 @@ describe("LiveKit telephony lifecycle", () => {
     await h.handler.close();
     await h.provider.stop();
     expect(h.bridge.close).toHaveBeenCalled();
+  });
+
+  it("preserves the default prompt and built-in function tools over RTC", async () => {
+    const h = await harness("open", livekit, false);
+    const started = await h.manager.initiateCall(to, undefined, { mode: "conversation" });
+    const call = h.manager.getCall(started.callId)!;
+    const binding = await h.handler.attachRoomTransport({
+      callId: call.callId,
+      providerCallId: call.providerCallId!,
+      streamId: "rtc-function-tools",
+      transport: { readyState: 1, bufferedAmount: 0, send: vi.fn(), close: vi.fn() },
+    });
+    expect(binding).not.toBeNull();
+    const options = h.createModelBridge.mock.calls[0]![0];
+    expect(options.instructions).toBe(DEFAULT_VOICE_CALL_REALTIME_INSTRUCTIONS);
+    expect(options.tools?.map((tool) => tool.name)).toEqual([
+      "openclaw_end_call",
+      REALTIME_VOICE_AGENT_CONSULT_TOOL_NAME,
+    ]);
+    expect(options.runAgentConsult).toBeUndefined();
+    options.onToolCall?.({
+      name: "openclaw_end_call",
+      args: {},
+      callId: "end-current",
+      itemId: "end-item",
+    });
+    await vi.waitFor(() => {
+      expect(h.rooms.deleteRoom).toHaveBeenCalledWith(call.providerCallId);
+      expect(call.state).toBe("hangup-bot");
+      expect(h.manager.getCall(call.callId)).toBeUndefined();
+    });
+    binding!.endCall();
+    await h.handler.close();
+    await h.provider.stop();
   });
 
   it("distinguishes missing rooms from transient status failures and shuts down active calls", async () => {
