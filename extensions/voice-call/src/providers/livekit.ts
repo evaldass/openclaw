@@ -63,6 +63,9 @@ export class LiveKitProvider implements VoiceCallProvider {
   private stopping = false;
   private stopPromise?: Promise<void>;
   private cleanupFailed = false;
+  private readonly pendingCleanup = new Set<string>();
+  private readonly restoredCleanup = new Set<string>();
+  private cleanupRetryTimer?: ReturnType<typeof setTimeout>;
 
   constructor(
     private readonly config: LiveKitConfig,
@@ -90,6 +93,70 @@ export class LiveKitProvider implements VoiceCallProvider {
   }
 
   /** A crashed RTC session cannot safely reuse its delegation/audio ownership. */
+  private retire(room: string): void {
+    this.retiredRooms.delete(room);
+    this.retiredRooms.set(room, Date.now() + 300000);
+    while (this.retiredRooms.size > 4096)
+      this.retiredRooms.delete(this.retiredRooms.keys().next().value!);
+  }
+
+  private rejectRoom(room: string): void {
+    this.retire(room);
+    const cleanup = this.deleteRoom(room);
+    this.operations.add(cleanup);
+    void cleanup.then(
+      () => this.operations.delete(cleanup),
+      () => {
+        this.operations.delete(cleanup);
+        console.warn("[voice-call] LiveKit rejected room cleanup pending retry");
+      },
+    );
+  }
+
+  private async deleteRoom(room: string): Promise<void> {
+    try {
+      await this.deps.rooms.deleteRoom(room);
+    } catch (error) {
+      if (!(error instanceof ServerError && error.code === "not_found")) {
+        this.pendingCleanup.add(room);
+        this.cleanupFailed = true;
+        this.scheduleCleanupRetry();
+        throw new Error("LiveKit room cleanup failed");
+      }
+    }
+    this.pendingCleanup.delete(room);
+    this.cleanupFailed = this.pendingCleanup.size > 0;
+  }
+
+  private scheduleCleanupRetry(): void {
+    if (this.stopping || this.cleanupRetryTimer) return;
+    this.cleanupRetryTimer = setTimeout(() => {
+      this.cleanupRetryTimer = undefined;
+      const retry = this.retryPendingCleanup();
+      this.operations.add(retry);
+      void retry.finally(() => {
+        this.operations.delete(retry);
+        if (this.pendingCleanup.size) this.scheduleCleanupRetry();
+      });
+    }, 30000);
+    this.cleanupRetryTimer.unref();
+  }
+
+  async retryPendingCleanup(): Promise<void> {
+    for (const room of [...this.pendingCleanup]) {
+      try {
+        const call = this.manager?.getCallByProviderCallId(room);
+        if (this.restoredCleanup.has(room) && call) {
+          const ended = await this.manager!.endCall(call.callId, { reason: "completed" });
+          if (!ended.success) continue;
+          this.restoredCleanup.delete(room);
+        } else await this.deleteRoom(room);
+      } catch {
+        console.warn("[voice-call] LiveKit room cleanup pending retry");
+      }
+    }
+  }
+
   async retireRestoredCalls(): Promise<void> {
     for (const call of this.manager?.getActiveCalls() ?? []) {
       if (
@@ -98,7 +165,14 @@ export class LiveKitProvider implements VoiceCallProvider {
         !this.calls.has(call.providerCallId)
       ) {
         const result = await this.manager!.endCall(call.callId, { reason: "completed" });
-        if (!result.success) throw new Error("LiveKit restored call cleanup failed");
+        if (!result.success) {
+          this.restoredCleanup.add(call.providerCallId);
+          this.pendingCleanup.add(call.providerCallId);
+          this.scheduleCleanupRetry();
+          console.warn(
+            "[voice-call] LiveKit restored call cleanup pending retry; RTC admission disabled for retained call",
+          );
+        }
       }
     }
   }
@@ -141,7 +215,7 @@ export class LiveKitProvider implements VoiceCallProvider {
   parseWebhookEvent(ctx: WebhookContext): ProviderWebhookParseResult {
     const event = this.verified.get(ctx);
     this.verified.delete(ctx);
-    if (!event || this.stopping) return { events: [] };
+    if (!event) return { events: [] };
     const room = event.room?.name;
     if (!room?.startsWith(this.config.roomPrefix)) return { events: [] };
     const now = Date.now();
@@ -150,23 +224,24 @@ export class LiveKitProvider implements VoiceCallProvider {
     if (this.retiredRooms.has(room)) return { events: [] };
     let call = this.calls.get(room);
     if (!call && event.event === "room_finished") {
-      if (this.retiredRooms.size < 4096) this.retiredRooms.set(room, now + 86400000);
+      this.retire(room);
       return { events: [] };
     }
     const participant = event.participant;
-    if (
-      !call &&
-      this.retiredRooms.size < 4096 &&
-      event.event === "participant_joined" &&
-      participant?.kind === 3
-    ) {
+    if (!call && event.event === "participant_joined" && participant?.kind === 3) {
       const attrs = participant.attributes;
+      if (this.stopping || !this.manager || !this.handler || this.restoredCleanup.has(room)) {
+        this.rejectRoom(room);
+        return { events: [] };
+      }
       if (
         !this.config.inboundTrunkIds.includes(attrs["sip.trunkID"] ?? "") ||
         !/^\+[1-9]\d{1,14}$/.test(attrs["sip.phoneNumber"] ?? "") ||
         !/^\+[1-9]\d{1,14}$/.test(attrs["sip.trunkPhoneNumber"] ?? "")
-      )
+      ) {
+        this.rejectRoom(room);
         return { events: [] };
+      }
       call = {
         room,
         callId: room,
@@ -192,7 +267,7 @@ export class LiveKitProvider implements VoiceCallProvider {
       dedupeKey: `livekit:${event.id}`,
       callId: call.callId,
       providerCallId: room,
-      timestamp: Number(event.createdAt) * 1000,
+      timestamp: Number(event.createdAt) > 0 ? Number(event.createdAt) * 1000 : now,
       direction: call.direction,
       from: call.from,
       to: call.to,
@@ -272,7 +347,11 @@ export class LiveKitProvider implements VoiceCallProvider {
       await this.join(call);
       return { providerCallId: room, status: "initiated" };
     } catch {
-      await this.dispose(call).catch(() => {});
+      try {
+        await this.dispose(call);
+      } catch {
+        throw new Error("LiveKit call setup failed; room cleanup pending retry");
+      }
       throw new Error(
         "LiveKit call setup failed; check trunk, connectivity, and realtime configuration",
       );
@@ -337,8 +416,8 @@ export class LiveKitProvider implements VoiceCallProvider {
         handler: this.handler,
         isCurrent: () =>
           !call.closed && !this.stopping && this.manager?.getCall(call.callId) === record,
-        onDisconnect: () => {
-          void this.manager?.endCall(call.callId, { reason: "completed" });
+        onDisconnect: (reason) => {
+          void this.manager?.endCall(call.callId, { reason });
         },
       });
       if (call.closed || this.stopping) {
@@ -352,14 +431,9 @@ export class LiveKitProvider implements VoiceCallProvider {
 
   private async dispose(call: CallRoom): Promise<void> {
     call.closed = true;
-    if (this.retiredRooms.size < 4096) this.retiredRooms.set(call.room, Date.now() + 86400000);
+    this.retire(call.room);
     await call.connection?.close();
-    try {
-      await this.deps.rooms.deleteRoom(call.room);
-    } catch (error) {
-      if (!(error instanceof ServerError && error.code === "not_found"))
-        throw new Error("LiveKit room cleanup failed");
-    }
+    await this.deleteRoom(call.room);
     this.calls.delete(call.room);
   }
 
@@ -367,12 +441,8 @@ export class LiveKitProvider implements VoiceCallProvider {
     const call = this.calls.get(input.providerCallId);
     if (call) await this.dispose(call);
     else if (input.providerCallId.startsWith(this.config.roomPrefix)) {
-      try {
-        await this.deps.rooms.deleteRoom(input.providerCallId);
-      } catch (error) {
-        if (!(error instanceof ServerError && error.code === "not_found"))
-          throw new Error("LiveKit room cleanup failed");
-      }
+      this.retire(input.providerCallId);
+      await this.deleteRoom(input.providerCallId);
     } else throw new Error("LiveKit call room is outside the configured room prefix");
   }
 
@@ -400,6 +470,7 @@ export class LiveKitProvider implements VoiceCallProvider {
   stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
     this.stopping = true;
+    if (this.cleanupRetryTimer) clearTimeout(this.cleanupRetryTimer);
     this.stopPromise = (async () => {
       const cleanup = await Promise.allSettled(
         [...this.calls.values()].map(async (call) => {
@@ -412,6 +483,7 @@ export class LiveKitProvider implements VoiceCallProvider {
         }),
       );
       await Promise.allSettled(this.operations);
+      await this.retryPendingCleanup();
       if (this.cleanupFailed || cleanup.some((result) => result.status === "rejected")) {
         throw new Error("LiveKit room cleanup failed during shutdown");
       }

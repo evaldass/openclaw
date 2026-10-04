@@ -14,7 +14,11 @@ import {
   type RealtimeVoiceProviderPlugin,
 } from "openclaw/plugin-sdk/realtime-voice";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { VoiceCallConfigSchema, validateProviderConfig } from "../config.js";
+import {
+  VoiceCallConfigSchema,
+  validateProviderConfig,
+  normalizeVoiceCallConfig,
+} from "../config.js";
 import { CallManager } from "../manager.js";
 import {
   createTestStorePath,
@@ -449,5 +453,138 @@ it("requires signed webhooks, valid server URL, and realtime audio", () => {
   expect(validateProviderConfig(config).errors).toContain("LiveKit requires realtime.enabled");
   expect(() =>
     VoiceCallConfigSchema.parse({ livekit: { ...livekit, url: "http://insecure.test" } }),
+  ).toThrow();
+});
+
+it("keeps inbound admission available after more than 4096 retired rooms", async () => {
+  const h = await harness();
+  for (let i = 0; i < 4100; i++)
+    await h.receive(webhook(`openclaw-call-churn-${i}`, "room_finished", `finished-${i}`));
+  await h.receive(webhook("openclaw-call-after-churn", "participant_joined", "new-inbound"));
+  expect(h.connectAudio).toHaveBeenCalledOnce();
+  await h.provider.stop();
+  await h.handler.close();
+});
+
+it.each(["wrong", "withheld"])(
+  "deletes rejected %s SIP rooms and tombstones late joins",
+  async (kind) => {
+    const h = await harness();
+    const room = `openclaw-call-reject-${kind}`;
+    const attributes = {
+      "sip.trunkID": kind === "wrong" ? "ST_wrong" : "ST_in",
+      "sip.phoneNumber": kind === "withheld" ? "anonymous" : from,
+      "sip.trunkPhoneNumber": to,
+    };
+    await h.receive(webhook(room, "participant_joined", "rejected", { attributes }));
+    await h.receive(webhook(room, "participant_joined", "late-valid"));
+    expect(h.rooms.deleteRoom).toHaveBeenCalledWith(room);
+    expect(h.connectAudio).not.toHaveBeenCalled();
+    await h.provider.stop();
+    await h.handler.close();
+  },
+);
+
+it("fails closed on startup webhooks before binding rather than stranding the caller", async () => {
+  const h = await harness();
+  const provider = new LiveKitProvider(livekit, {
+    rooms: h.rooms,
+    sip: h.sip,
+    receiver: h.receiver,
+    connectAudio: h.connectAudio,
+  });
+  const ctx = context(webhook("openclaw-call-before-bind"));
+  await provider.verifyWebhook(ctx);
+  expect(provider.parseWebhookEvent(ctx).events).toEqual([]);
+  await provider.stop();
+  expect(h.rooms.deleteRoom).toHaveBeenCalledWith("openclaw-call-before-bind");
+  expect(h.connectAudio).not.toHaveBeenCalled();
+  await h.provider.stop();
+  await h.handler.close();
+});
+
+it("surfaces failed dial cleanup and retries it without vendor secret leakage", async () => {
+  const h = await harness();
+  h.sip.createSipParticipant.mockRejectedValueOnce(new Error("secret vendor failure"));
+  h.rooms.deleteRoom.mockRejectedValueOnce(new Error("secret cleanup failure"));
+  const result = await h.manager.initiateCall(to, undefined, { mode: "conversation" });
+  expect(result.success).toBe(false);
+  expect(result.error).toContain("cleanup pending retry");
+  expect(result.error).not.toContain("secret");
+  await h.provider.retryPendingCleanup();
+  expect(h.rooms.deleteRoom).toHaveBeenCalledTimes(2);
+  await h.provider.stop();
+  await h.handler.close();
+});
+
+it("continues startup after transient restored cleanup failure and retries safely", async () => {
+  const h = await harness();
+  const started = await h.manager.initiateCall(to, undefined, { mode: "conversation" });
+  const replacement = new LiveKitProvider(livekit, {
+    rooms: h.rooms,
+    sip: h.sip,
+    receiver: h.receiver,
+    connectAudio: h.connectAudio,
+  });
+  replacement.bind(h.manager, h.handler);
+  h.rooms.deleteRoom.mockRejectedValueOnce(new Error("transient"));
+  const end = vi.spyOn(h.manager, "endCall");
+  end.mockResolvedValueOnce({ success: false, error: "transient" });
+  await expect(replacement.retireRestoredCalls()).resolves.toBeUndefined();
+  await replacement.retryPendingCleanup();
+  await replacement.retryPendingCleanup();
+  expect(h.manager.getCall(started.callId)).toBeUndefined();
+  await replacement.stop();
+  await h.provider.stop();
+  await h.handler.close();
+});
+
+it("uses current time for signed events lacking createdAt", async () => {
+  const h = await harness();
+  const event = webhook("openclaw-call-no-time");
+  event.createdAt = 0n;
+  const ctx = context(event);
+  await h.provider.verifyWebhook(ctx);
+  expect(h.provider.parseWebhookEvent(ctx).events[0]!.timestamp).toBeGreaterThan(0);
+  await h.provider.stop();
+  await h.handler.close();
+});
+
+it("enforces manager-owned inbound concurrency cap before another RTC join", async () => {
+  const h = await harness();
+  await h.receive(webhook("openclaw-call-first", "participant_joined", "first"));
+  await h.receive(webhook("openclaw-call-over-cap", "participant_joined", "second"));
+  expect(h.manager.getActiveCalls()).toHaveLength(1);
+  expect(h.connectAudio).toHaveBeenCalledOnce();
+  expect(h.rooms.deleteRoom).toHaveBeenCalledWith("openclaw-call-over-cap");
+  await h.provider.stop();
+  await h.handler.close();
+});
+
+it("runs service-owned cleanup retry without real waits", async () => {
+  const h = await harness();
+  vi.useFakeTimers();
+  try {
+    h.rooms.deleteRoom.mockRejectedValueOnce(new Error("transient"));
+    await h.receive(
+      webhook("openclaw-call-retry-timer", "participant_joined", "reject-timer", {
+        attributes: { "sip.trunkID": "wrong" },
+      }),
+    );
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(h.rooms.deleteRoom).toHaveBeenCalledTimes(2);
+    await h.provider.stop();
+    await h.handler.close();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("ignores invalid inactive LiveKit partial config at normalization boundary", () => {
+  expect(normalizeVoiceCallConfig({ provider: "mock", livekit: { url: "invalid" } }).provider).toBe(
+    "mock",
+  );
+  expect(() =>
+    normalizeVoiceCallConfig({ provider: "livekit", livekit: { url: "invalid" } }),
   ).toThrow();
 });

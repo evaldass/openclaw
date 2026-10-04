@@ -272,3 +272,12 @@ one authorized inbound and outbound call, rejected callers, webhook routing,
 TURN/media reachability, interruption, delegation/tool policy, and cleanup after
 remote hangup and Gateway shutdown using a non-production trunk. Do not count a
 room successfully created as proof that two-way speech works.
+
+LiveKit cleanup failures are recorded and retried by a service-owned 30-second
+retry timer without blocking plugin startup. Rejected owned-prefix SIP rooms are
+ended even when their trunk or caller attributes are invalid. Recent terminal
+room tombstones use a five-minute bounded replay cache with oldest-first eviction;
+cache capacity never disables admission of a new call. Long silent/DTX periods
+still require live acceptance testing against the existing realtime media-inactivity
+policy; offline tests do not establish that a particular SIP deployment emits
+continuous silence frames.
