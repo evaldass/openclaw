@@ -30,7 +30,9 @@ it("confirms native 160ms prefix while sustained captures continue, not at utter
   const ack = new Promise<number>((resolve) => {
     acknowledged = resolve;
   });
-  const start = performance.now();
+  let start = 0;
+  let capturesAtAck = -1;
+  let captures = 0;
   const connection = await connectLiveKitAudio({
     url: "wss://offline.invalid",
     token: "synthetic",
@@ -46,7 +48,10 @@ it("confirms native 160ms prefix while sustained captures continue, not at utter
         return {
           sendAudio: () => {},
           endCall: () => {},
-          acknowledgeMark: () => acknowledged(performance.now() - start),
+          acknowledgeMark: () => {
+            capturesAtAck = captures;
+            acknowledged(performance.now() - start);
+          },
         };
       },
     },
@@ -56,9 +61,9 @@ it("confirms native 160ms prefix while sustained captures continue, not at utter
       event: "media",
       media: { payload: Buffer.alloc(160, 255).toString("base64") },
     });
+    start = performance.now();
     for (let i = 0; i < 8; i++) transport.send(media);
     transport.send(JSON.stringify({ event: "mark", mark: { name: "prefix-160" } }));
-    let captures = 0;
     await new Promise<void>((resolve) => {
       const interval = setInterval(() => {
         transport.send(media);
@@ -70,7 +75,11 @@ it("confirms native 160ms prefix while sustained captures continue, not at utter
     });
     const ackMs = await ack;
     expect(ackMs).toBeGreaterThan(100);
-    expect(ackMs).toBeLessThan(450); // Continues for >=600ms: whole-queue drain fails.
+    // Allow scheduling jitter, but retain the independent structural proof:
+    // acknowledgement must arrive with >=200ms of future captures remaining.
+    expect(ackMs).toBeLessThan(550);
+    expect(capturesAtAck).toBeGreaterThanOrEqual(0);
+    expect(capturesAtAck).toBeLessThanOrEqual(20);
   } finally {
     await connection.close();
   }

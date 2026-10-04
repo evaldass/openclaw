@@ -60,9 +60,9 @@ export async function connectLiveKitAudio(
     })();
     return closePromise;
   };
-  const disconnected = () => {
+  const disconnected = (reason: "completed" | "error" = "completed") => {
     if (closed) return;
-    params.onDisconnect("completed");
+    params.onDisconnect(reason);
     void close().catch(() => {});
   };
   const transport: RealtimeMediaTransport = {
@@ -106,7 +106,7 @@ export async function connectLiveKitAudio(
               bufferedAmount -= pcm.length;
             }
           })
-          .catch(disconnected);
+          .catch(() => disconnected("error"));
       } else if (frame.event === "mark" && frame.mark) {
         const name = frame.mark.name;
         // Capture ordering fixes the mark's native queue position. queuedDuration
@@ -122,7 +122,7 @@ export async function connectLiveKitAudio(
             }, delayMs);
             marks.add(timer);
           })
-          .catch(disconnected);
+          .catch(() => disconnected("error"));
       }
     },
   };
@@ -133,7 +133,7 @@ export async function connectLiveKitAudio(
       (params.participantSid && participant.sid !== params.participantSid)
     ) {
       // A call room must never gain a third peer that could receive assistant speech.
-      disconnected();
+      disconnected("error");
       return;
     }
     for (const publication of participant.trackPublications.values()) {
@@ -145,7 +145,7 @@ export async function connectLiveKitAudio(
   room.on(rtc.RoomEvent.ParticipantDisconnected, (participant) => {
     if (participant.identity === params.identity) disconnected();
   });
-  room.on(rtc.RoomEvent.Disconnected, disconnected);
+  room.on(rtc.RoomEvent.Disconnected, () => disconnected());
   room.on(rtc.RoomEvent.TrackSubscribed, (track, _publication, participant) => {
     if (
       !current() ||
@@ -174,7 +174,7 @@ export async function connectLiveKitAudio(
           binding?.sendAudio(convertPcmToMulaw8k(pcm, value.sampleRate));
         }
       } catch {
-        disconnected();
+        disconnected("error");
       } finally {
         readers.delete(reader);
         reader.releaseLock();

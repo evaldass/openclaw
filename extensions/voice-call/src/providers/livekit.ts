@@ -62,7 +62,7 @@ export class LiveKitProvider implements VoiceCallProvider {
   private handler?: RealtimeCallHandler;
   private stopping = false;
   private stopPromise?: Promise<void>;
-  private cleanupFailed = false;
+  private readonly disconnectFailures = new Set<string>();
   private readonly pendingCleanup = new Set<string>();
   private readonly restoredCleanup = new Set<string>();
   private cleanupRetryTimer?: ReturnType<typeof setTimeout>;
@@ -119,13 +119,11 @@ export class LiveKitProvider implements VoiceCallProvider {
     } catch (error) {
       if (!(error instanceof ServerError && error.code === "not_found")) {
         this.pendingCleanup.add(room);
-        this.cleanupFailed = true;
         this.scheduleCleanupRetry();
         throw new Error("LiveKit room cleanup failed");
       }
     }
     this.pendingCleanup.delete(room);
-    this.cleanupFailed = this.pendingCleanup.size > 0;
   }
 
   private scheduleCleanupRetry(): void {
@@ -150,7 +148,10 @@ export class LiveKitProvider implements VoiceCallProvider {
           const ended = await this.manager!.endCall(call.callId, { reason: "completed" });
           if (!ended.success) continue;
           this.restoredCleanup.delete(room);
-        } else await this.deleteRoom(room);
+        } else {
+          await this.deleteRoom(room);
+          this.restoredCleanup.delete(room);
+        }
       } catch {
         console.warn("[voice-call] LiveKit room cleanup pending retry");
       }
@@ -286,7 +287,7 @@ export class LiveKitProvider implements VoiceCallProvider {
         () => this.operations.delete(cleanup),
         () => {
           this.operations.delete(cleanup);
-          this.cleanupFailed = true;
+          console.warn("[voice-call] LiveKit call cleanup failed");
         },
       );
       events.push({ ...base, type: "call.ended", reason: "completed" });
@@ -432,9 +433,16 @@ export class LiveKitProvider implements VoiceCallProvider {
   private async dispose(call: CallRoom): Promise<void> {
     call.closed = true;
     this.retire(call.room);
-    await call.connection?.close();
+    try {
+      await call.connection?.close();
+    } catch {
+      // Room deletion is still mandatory. A successful unrelated deletion must
+      // never erase an RTC disconnect failure (close promises are idempotent).
+      this.disconnectFailures.add(call.room);
+    }
     await this.deleteRoom(call.room);
     this.calls.delete(call.room);
+    if (this.disconnectFailures.has(call.room)) throw new Error("LiveKit RTC disconnect failed");
   }
 
   async hangupCall(input: HangupCallInput): Promise<void> {
@@ -486,7 +494,7 @@ export class LiveKitProvider implements VoiceCallProvider {
       await this.retryPendingCleanup();
       if (
         this.pendingCleanup.size > 0 ||
-        this.cleanupFailed ||
+        this.disconnectFailures.size > 0 ||
         cleanup.some((result) => result.status === "rejected")
       ) {
         throw new Error("LiveKit room cleanup failed during shutdown");

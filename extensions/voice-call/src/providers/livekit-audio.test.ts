@@ -95,7 +95,7 @@ function harness() {
   const playedPromise = new Promise<void>((resolve) => {
     played = resolve;
   });
-  const acknowledgeMark = vi.fn(() => played());
+  const acknowledgeMark = vi.fn((_name: string) => played());
   const onDisconnect = vi.fn();
   const handler: LiveKitAudioParams["handler"] = {
     attachRoomTransport: vi.fn(async (params) => {
@@ -186,7 +186,7 @@ it("terminates on foreign peer or RTC disconnect and prevents audio after cancel
   const h = harness();
   const connection = await connectLiveKitAudio(h.params);
   mock.room!.emit("participantConnected", { identity: "foreign", sid: "PA_foreign" });
-  expect(h.onDisconnect).toHaveBeenCalledOnce();
+  expect(h.onDisconnect).toHaveBeenCalledExactlyOnceWith("error");
   expect(h.transport().readyState).toBe(3);
   h.transport().send(JSON.stringify({ event: "media", media: { payload: "////" } }));
   await connection.close();
@@ -276,3 +276,33 @@ it("advances pacer truncation position mid-response and clears pending generatio
     vi.useRealTimers();
   }
 });
+
+it.each(["capture", "reader"] as const)("classifies %s failure as error", async (failure) => {
+  const h = harness();
+  const connection = await connectLiveKitAudio(h.params);
+  if (failure === "capture") {
+    mock.capture.mockRejectedValueOnce(new Error("capture failed"));
+    h.transport().send(JSON.stringify({ event: "media", media: { payload: "////" } }));
+  } else {
+    mock.room!.emit(
+      "trackSubscribed",
+      { kind: 1, sid: "TR_error" },
+      {},
+      { identity: "sip-test", sid: "PA_test" },
+    );
+    mock.input!.error(new Error("reader failed"));
+  }
+  await vi.waitFor(() => expect(h.onDisconnect).toHaveBeenCalledExactlyOnceWith("error"));
+  await connection.close();
+});
+
+it.each(["disconnected", "participantDisconnected"])(
+  "classifies normal %s as completed",
+  async (event) => {
+    const h = harness();
+    const connection = await connectLiveKitAudio(h.params);
+    mock.room!.emit(event, { identity: "sip-test" });
+    expect(h.onDisconnect).toHaveBeenCalledExactlyOnceWith("completed");
+    await connection.close();
+  },
+);
