@@ -23,7 +23,7 @@ audio mode per call.
 
 Runtime behavior:
 
-- `realtime.enabled` is supported for Twilio and Telnyx.
+- `realtime.enabled` is supported for LiveKit, Twilio, and Telnyx.
 - `realtime.provider` is optional. If unset, Voice Call selects the first configured realtime voice provider in provider priority order. Providers named in `realtime.providers` are discovered even when another provider is already active; plugin disablement and allow/deny rules still apply.
 - Bundled realtime voice providers: Google Gemini Live (`google`) and OpenAI (`openai`), registered by their provider plugins.
 - Provider-owned raw config lives under `realtime.providers.<providerId>`.
@@ -73,7 +73,8 @@ provider default.
 }
 ```
 
-The bridge converts carrier G.711 mu-law audio at 8 kHz to and from the model's
+LiveKit uses mono PCM through the native RTC SDK and the same call-owned
+telephony audio bridge. The bridge converts carrier G.711 mu-law audio at 8 kHz to and from the model's
 24 kHz PCM stream. GPT-Live receives microphone input during playback and owns
 speech interruption; Voice Call does not add local speech-triggered cancellation.
 Initial greetings and `voicecall.speak` requests use the same native session

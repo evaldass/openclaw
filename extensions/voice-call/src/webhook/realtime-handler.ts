@@ -217,6 +217,18 @@ export type StreamSession = {
   streamUrl: string;
 };
 
+export type RealtimeMediaTransport = {
+  readonly readyState: number;
+  readonly bufferedAmount: number;
+  send: (message: string) => void;
+  close: (code?: number, reason?: string) => void;
+};
+export type RealtimeRoomBinding = {
+  sendAudio: (audio: Buffer) => void;
+  endCall: () => void;
+  acknowledgeMark: (name: string) => void;
+};
+
 type RealtimeCallRegistration = {
   agentId: string;
   instructions: string;
@@ -323,8 +335,9 @@ function appendRecentTalkEventMetadata(
 export class RealtimeCallHandler {
   private readonly toolHandlers = new Map<string, ToolHandlerFn>();
   private readonly pendingStreamTokens = new Map<string, PendingStreamToken>();
+  private readonly roomBindings = new Set<RealtimeTelephonyBinding>();
   private readonly activeSockets = new Set<WebSocket>();
-  private readonly serverClosingSockets = new WeakSet<WebSocket>();
+  private readonly serverClosingSockets = new WeakSet<RealtimeMediaTransport>();
   private readonly activeBridgesByCallId = new Map<string, ActiveRealtimeVoiceBridge>();
   private readonly activeTelephonyBindingsByCallId = new Map<string, RealtimeTelephonyBinding>();
   private readonly userTranscriptStatesByCallId = new Map<string, UserTranscriptState>();
@@ -564,6 +577,7 @@ export class RealtimeCallHandler {
     const sockets = [...this.activeSockets];
     this.closePromise = Promise.allSettled([
       shutdownBarrier,
+      ...[...this.roomBindings].map((binding) => binding.close("shutdown")),
       ...sockets.map(
         (ws) =>
           new Promise<void>((resolve) => {
@@ -682,12 +696,51 @@ export class RealtimeCallHandler {
     return request;
   }
 
+  /** Attach an authenticated RTC room after manager admission, without a public media WebSocket. */
+  async attachRoomTransport(params: {
+    callId: string;
+    providerCallId: string;
+    streamId: string;
+    transport: RealtimeMediaTransport;
+  }): Promise<RealtimeRoomBinding | null> {
+    if (this.closing) return null;
+    const admission = this.handleCall(
+      params.streamId,
+      params.providerCallId,
+      params.transport,
+      { callId: params.callId },
+      new StreamFrameAdapter("twilio"),
+    );
+    this.trackShutdownWork(
+      admission.then(() => {}),
+      this.admissions,
+    );
+    const admitted = await admission;
+    if (!admitted) return null;
+    if (this.closing) {
+      await admitted.close("shutdown");
+      return null;
+    }
+    this.roomBindings.add(admitted);
+    return {
+      sendAudio: (audio) => {
+        admitted.noteMediaActivity();
+        admitted.bridge.sendAudio(audio);
+      },
+      endCall: () => {
+        this.roomBindings.delete(admitted);
+        admitted.endCall();
+      },
+      acknowledgeMark: (name) => admitted.acknowledgeCarrierMark(name),
+    };
+  }
+
   private async handleCall(
     streamSid: string,
     callSid: string,
-    ws: WebSocket,
+    ws: RealtimeMediaTransport,
     callerMeta: Omit<PendingStreamToken, "expiry">,
-    adapter: StreamFrameAdapter,
+    adapter: Pick<StreamFrameAdapter, "serializeMedia" | "serializeClear" | "serializeMark">,
   ): Promise<RealtimeTelephonyBinding | null> {
     const preparedCall = await this.prepareCallInManager(callSid, callerMeta);
     if (!preparedCall) {

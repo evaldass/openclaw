@@ -18,7 +18,7 @@ starting the runtime. Commands, RPC calls, and agent tools still return the
 exact missing configuration when used.
 
 <Note>
-Voice-call credentials accept SecretRefs. `plugins.entries.voice-call.config.twilio.authToken`, `plugins.entries.voice-call.config.realtime.providers.*.apiKey`, `plugins.entries.voice-call.config.streaming.providers.*.apiKey`, and `plugins.entries.voice-call.config.tts.providers.*.apiKey` resolve through the standard SecretRef surface; see [SecretRef credential surface](/reference/secretref-credential-surface).
+Voice-call credentials accept SecretRefs. `plugins.entries.voice-call.config.livekit.apiKey`, `plugins.entries.voice-call.config.livekit.apiSecret`, `plugins.entries.voice-call.config.twilio.authToken`, `plugins.entries.voice-call.config.realtime.providers.*.apiKey`, `plugins.entries.voice-call.config.streaming.providers.*.apiKey`, and `plugins.entries.voice-call.config.tts.providers.*.apiKey` resolve through the standard SecretRef surface; see [SecretRef credential surface](/reference/secretref-credential-surface).
 </Note>
 
 ```json5
@@ -28,7 +28,7 @@ Voice-call credentials accept SecretRefs. `plugins.entries.voice-call.config.twi
       "voice-call": {
         enabled: true,
         config: {
-          provider: "twilio", // or "telnyx" | "plivo" | "mock"
+          provider: "twilio", // or "livekit" | "telnyx" | "plivo" | "mock"
           fromNumber: "+15550001234", // or TWILIO_FROM_NUMBER for Twilio
           toNumber: "+15550005678",
           sessionScope: "per-phone", // per-phone | per-call | main
@@ -194,3 +194,81 @@ integration keys resolve into the same namespace: a canonical
 main-session/global-scope aliasing; foreign or malformed `agent:*` input
 is scoped as an opaque key under the configured agent; `global` and `unknown`
 remain global sentinels.
+
+## LiveKit SIP telephony
+
+`provider: "livekit"` is the telephone transport, not the realtime model.
+It uses the supported LiveKit Node RTC SDK in the Gateway and the existing
+Voice Call realtime bridge, including GPT-Live native agent delegation.
+`realtime.enabled` is required; classic TTS/GetInput and DTMF are not supported.
+Configure your model under `realtime.providers.openai.model`; leaving it unset
+keeps the provider default. GPT-Live's existing function-tool limitations still
+apply. No separate LiveKit Agents worker is required.
+
+```json5 validate=false
+{
+  provider: "livekit",
+  agentId: "main",
+  fromNumber: "+15550001234",
+  inboundPolicy: "allowlist",
+  allowFrom: ["+15550005678"],
+  sessionScope: "per-call",
+  outbound: { defaultMode: "conversation" },
+  livekit: {
+    url: "wss://livekit.example.com",
+    apiKey: { source: "env", provider: "default", id: "LIVEKIT_API_KEY" },
+    apiSecret: { source: "env", provider: "default", id: "LIVEKIT_API_SECRET" },
+    outboundTrunkId: "ST_outbound",
+    inboundTrunkIds: ["ST_inbound"],
+    roomPrefix: "openclaw-call-",
+  },
+  realtime: {
+    enabled: true,
+    provider: "openai",
+    providers: { openai: { model: "gpt-live-1", voice: "marin" } }, // Platform API route; configurable.
+  },
+  serve: { port: 3334, path: "/voice/webhook" },
+  publicUrl: "https://voice.example.com/voice/webhook",
+}
+```
+
+External prerequisites (the plugin does **not** create or modify SIP trunks,
+carrier routing, or dispatch rules):
+
+1. Provision an outbound SIP trunk and select its ID with `outboundTrunkId`.
+   The configured `fromNumber` must be permitted by that trunk/carrier.
+2. Provision inbound trunks and a LiveKit **individual** SIP dispatch rule,
+   restricted to `inboundTrunkIds`, using the exact `roomPrefix`. Reserve this
+   prefix exclusively for this plugin. Set the dispatch room configuration/preset
+   to `maxParticipants: 2` (one SIP caller and one OpenClaw RTC participant); the
+   plugin verifies this server-enforced cap before joining. Never use a
+   shared/direct conference room.
+   Keep caller identity visible (`hidePhoneNumber: false`); LiveKit must supply
+   `sip.trunkID`, `sip.phoneNumber`, and `sip.trunkPhoneNumber` in participant
+   attributes. Anonymous callers and unselected trunks cannot enter OpenClaw.
+3. Route your telephone numbers to LiveKit SIP, and configure LiveKit's signed
+   webhook delivery to `publicUrl` using the configured server API key. Preserve
+   the raw JSON body and `Authorization` header through your HTTPS reverse proxy.
+   Private LiveKit deployments can route this webhook over their private network;
+   LiveKit Cloud requires a publicly reachable HTTPS endpoint.
+4. Permit RTC signaling and WebRTC media between the Gateway and LiveKit,
+   including TURN where needed. Install plugin dependencies on a supported native
+   RTC platform; a browser-only LiveKit client is insufficient.
+5. Configure the selected realtime provider's server-side credentials separately.
+   LiveKit credentials do not authorize GPT-Live/OpenAI.
+
+API key/secret accept SecretRefs. Do not supply durable static room tokens.
+Each admitted call generates a unique 60-second room-scoped microphone JWT,
+without room-admin, SIP-admin, data publishing, or metadata grants. Tokens and
+vendor errors are never returned to callers. The SIP caller's identity and SID
+are checked before room audio is published or subscribed. Additional peers end
+the call instead of receiving another caller's conversation. Existing caller
+allowlist, per-number routing, agent/tool policy, duration limits, and call-owned
+cancellation remain authoritative. After an unclean Gateway restart, retained
+LiveKit calls are ended rather than resumed with stale audio/delegation ownership.
+
+Offline tests do not prove carrier interoperability. Before production, validate
+one authorized inbound and outbound call, rejected callers, webhook routing,
+TURN/media reachability, interruption, delegation/tool policy, and cleanup after
+remote hangup and Gateway shutdown using a non-production trunk. Do not count a
+room successfully created as proof that two-way speech works.

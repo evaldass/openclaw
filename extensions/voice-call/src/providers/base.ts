@@ -28,7 +28,11 @@ export interface VoiceCallProvider {
    * Verify webhook signature/HMAC before processing.
    * Must be called before parseWebhookEvent.
    */
-  verifyWebhook(ctx: WebhookContext): WebhookVerificationResult;
+  verifyWebhook(
+    ctx: WebhookContext,
+  ): WebhookVerificationResult | Promise<WebhookVerificationResult>;
+
+  stop?(): Promise<void>;
 
   /**
    * Parse provider-specific webhook payload into normalized events.
