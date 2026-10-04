@@ -34,9 +34,14 @@ const LiveKitConfigSchema = z
       .string()
       .url()
       .refine((value) => {
-        const url = new URL(value);
+        const url = URL.parse(value);
         return (
-          url.protocol === "wss:" && !url.username && !url.password && !url.search && !url.hash
+          url !== null &&
+          url.protocol === "wss:" &&
+          !url.username &&
+          !url.password &&
+          !url.search &&
+          !url.hash
         );
       }, "LiveKit requires a wss:// server URL without embedded credentials or tokens"),
     apiKey: SecretInputSchema.optional(),
@@ -588,7 +593,11 @@ export function normalizeVoiceCallConfig(config: VoiceCallConfigInput): VoiceCal
   return {
     ...defaults,
     ...config,
-    livekit: config.livekit ? LiveKitConfigSchema.parse(config.livekit) : undefined,
+    livekit: config.livekit
+      ? config.provider === "livekit"
+        ? LiveKitConfigSchema.parse(config.livekit)
+        : LiveKitConfigSchema.safeParse(config.livekit).data
+      : undefined,
     allowFrom: config.allowFrom ?? defaults.allowFrom,
     numbers: sanitizeVoiceCallNumberRoutes(
       (config.numbers ?? defaults.numbers) as Record<string, unknown>,

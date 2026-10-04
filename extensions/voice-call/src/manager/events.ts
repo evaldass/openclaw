@@ -216,7 +216,11 @@ async function processEventInQueue(
   if (!call && providerCallId && event.direction) {
     // Apply inbound policy for true inbound calls; external outbound-api calls
     // are implicitly trusted because the caller controls the webhook URL.
-    if (event.direction === "inbound" && !shouldAcceptInbound(ctx.config, event.from)) {
+    if (
+      event.direction === "inbound" &&
+      (!shouldAcceptInbound(ctx.config, event.from) ||
+        ctx.activeCalls.size >= ctx.config.maxConcurrentCalls)
+    ) {
       const pid = providerCallId;
       if (!ctx.provider) {
         log.warn(

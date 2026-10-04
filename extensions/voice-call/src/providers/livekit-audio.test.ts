@@ -6,6 +6,7 @@ import { connectLiveKitAudio, type LiveKitAudioParams } from "./livekit-audio.js
 
 const mock = vi.hoisted(() => ({
   capture: vi.fn(async (_frame: { data: Int16Array }) => {}),
+  playout: vi.fn(async () => {}),
   clear: vi.fn(),
   close: vi.fn(async () => {}),
   publish: vi.fn(async () => {}),
@@ -45,7 +46,8 @@ vi.mock("@livekit/rtc-node", async () => {
       captureFrame = mock.capture;
       clearQueue = mock.clear;
       close = mock.close;
-      async waitForPlayout() {}
+      waitForPlayout = mock.playout;
+      queuedDuration = 0;
     },
     AudioFrame: class {
       constructor(
@@ -193,4 +195,35 @@ it("rejects manager cancellation during RTC admission", async () => {
   );
   expect(mock.publish).not.toHaveBeenCalled();
   expect(h.params.handler.attachRoomTransport).not.toHaveBeenCalled();
+});
+
+it("does not block later media captures while a playback mark waits", async () => {
+  let release!: () => void;
+  mock.playout.mockImplementationOnce(
+    () =>
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+  );
+  const h = harness();
+  const connection = await connectLiveKitAudio(h.params);
+  const media = JSON.stringify({ event: "media", media: { payload: "////" } });
+  h.transport().send(media);
+  h.transport().send(JSON.stringify({ event: "mark", mark: { name: "delayed" } }));
+  h.transport().send(media);
+  for (let i = 0; i < 12; i++) await Promise.resolve();
+  expect(mock.capture).toHaveBeenCalledTimes(2);
+  expect(h.acknowledgeMark).not.toHaveBeenCalled();
+  release();
+  await h.playedPromise;
+  expect(h.acknowledgeMark).toHaveBeenCalledWith("delayed");
+  await connection.close();
+});
+
+it.each([1008, 1011, 1013])("propagates transport error close %s", async (code) => {
+  const h = harness();
+  const connection = await connectLiveKitAudio(h.params);
+  h.transport().close(code);
+  expect(h.onDisconnect).toHaveBeenCalledWith("error");
+  await connection.close();
 });

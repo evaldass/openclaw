@@ -372,7 +372,8 @@
         "properties": {
           "url": {
             "type": "string",
-            "format": "uri"
+            "format": "uri",
+            "pattern": "^wss://[^/?#@]+(?:/[^?#]*)?$"
           },
           "apiKey": {
             "type": [

@@ -15,7 +15,7 @@ export type LiveKitAudioParams = {
   callId: string;
   handler: Pick<RealtimeCallHandler, "attachRoomTransport">;
   isCurrent: () => boolean;
-  onDisconnect: () => void;
+  onDisconnect: (reason: "completed" | "error") => void;
 };
 
 /** Native supported RTC SDK, not SIP-as-WebSocket or a browser-only shim. */
@@ -31,6 +31,9 @@ export async function connectLiveKitAudio(
   let generation = 0;
   let bufferedAmount = 0;
   let output = Promise.resolve();
+  let capturedSamples = 0;
+  let playedSamples = 0;
+  const marks = new Set<Promise<void>>();
   let closePromise: Promise<void> | undefined;
   let connectPromise: Promise<void> | undefined;
   const readers = new Set<ReadableStreamDefaultReader<InstanceType<typeof rtc.AudioFrame>>>();
@@ -49,13 +52,14 @@ export async function connectLiveKitAudio(
       await room.disconnect();
       await output.catch(() => {});
       await source.close();
+      await Promise.allSettled(marks);
       await Promise.allSettled(tasks);
     })();
     return closePromise;
   };
   const disconnected = () => {
     if (closed) return;
-    params.onDisconnect();
+    params.onDisconnect("completed");
     void close().catch(() => {});
   };
   const transport: RealtimeMediaTransport = {
@@ -65,7 +69,11 @@ export async function connectLiveKitAudio(
     get bufferedAmount() {
       return bufferedAmount;
     },
-    close: disconnected,
+    close: (code) => {
+      if (closed) return;
+      params.onDisconnect(code === 1008 || code === 1011 || code === 1013 ? "error" : "completed");
+      void close().catch(() => {});
+    },
     send: (raw) => {
       if (!current()) return;
       const frame = JSON.parse(String(raw)) as {
@@ -76,6 +84,8 @@ export async function connectLiveKitAudio(
       if (frame.event === "clear") {
         generation++;
         source.clearQueue();
+        capturedSamples = 0;
+        playedSamples = 0;
         return;
       }
       const owner = generation;
@@ -87,8 +97,14 @@ export async function connectLiveKitAudio(
         output = output
           .then(async () => {
             try {
-              if (current() && owner === generation)
+              if (current() && owner === generation) {
                 await source.captureFrame(new rtc.AudioFrame(samples, 8000, 1, samples.length));
+                capturedSamples += samples.length;
+                playedSamples = Math.max(
+                  playedSamples,
+                  capturedSamples - source.queuedDuration * 8000,
+                );
+              }
             } finally {
               bufferedAmount -= pcm.length;
             }
@@ -96,13 +112,21 @@ export async function connectLiveKitAudio(
           .catch(disconnected);
       } else if (frame.event === "mark" && frame.mark) {
         const name = frame.mark.name;
-        output = output
+        // Snapshot the captured prefix, but never place playout waits on the
+        // capture chain: model deltas must continue feeding the native queue.
+        const mark = output
           .then(async () => {
             if (!current() || owner !== generation) return;
+            const boundary = capturedSamples;
             await source.waitForPlayout();
-            if (current() && owner === generation) binding?.acknowledgeMark(name);
+            if (current() && owner === generation) {
+              playedSamples = Math.max(playedSamples, boundary);
+              if (playedSamples >= boundary) binding?.acknowledgeMark(name);
+            }
           })
           .catch(disconnected);
+        marks.add(mark);
+        void mark.finally(() => marks.delete(mark));
       }
     },
   };
