@@ -110,7 +110,7 @@ async function harness(policy: "open" | "allowlist" = "open") {
   const connectAudio = vi.fn<LiveKitDependencies["connectAudio"]>(async () => ({ close }));
   const rooms = {
     createRoom: vi.fn<LiveKitDependencies["rooms"]["createRoom"]>(async () => new Room()),
-    deleteRoom: vi.fn(async () => {}),
+    deleteRoom: vi.fn<LiveKitDependencies["rooms"]["deleteRoom"]>(async () => {}),
     listRooms: vi.fn<LiveKitDependencies["rooms"]["listRooms"]>(async (names) =>
       names!.map((name) => new Room({ name, maxParticipants: 2 })),
     ),
@@ -631,5 +631,51 @@ it("reports pending restored cleanup at shutdown even when endCall fails before 
   await expect(replacement.stop()).rejects.toThrow("cleanup failed during shutdown");
   end.mockRestore();
   await h.provider.stop();
+  await h.handler.close();
+});
+
+it.each([false, true])(
+  "deletes room despite RTC close failure and preserves shutdown failure (delete fails: %s)",
+  async (deleteFails) => {
+    const h = await harness();
+    const room = "openclaw-call-disconnect-failure";
+    await h.receive(webhook(room));
+    h.close.mockRejectedValue(new Error("secret disconnect failure"));
+    if (deleteFails) h.rooms.deleteRoom.mockRejectedValueOnce(new Error("secret delete failure"));
+    await h.receive(webhook(room, "participant_left", "left"));
+    await h.provider.retryPendingCleanup();
+    expect(h.rooms.deleteRoom).toHaveBeenCalledWith(room);
+    if (deleteFails)
+      expect(h.rooms.deleteRoom.mock.calls.filter(([name]) => name === room)).toHaveLength(2);
+    // Successful unrelated cleanup must not clear the RTC failure.
+    await h.provider.hangupCall({
+      providerCallId: "openclaw-call-unrelated",
+      callId: "unrelated",
+      reason: "completed",
+    });
+    await expect(h.provider.stop()).rejects.toThrow("cleanup failed during shutdown");
+    await h.handler.close();
+  },
+);
+
+it("removes restored cleanup bookkeeping when the manager record disappeared", async () => {
+  const h = await harness();
+  await h.manager.initiateCall(to, undefined, { mode: "conversation" });
+  const replacement = new LiveKitProvider(livekit, {
+    rooms: h.rooms,
+    sip: h.sip,
+    receiver: h.receiver,
+    connectAudio: h.connectAudio,
+  });
+  replacement.bind(h.manager, h.handler);
+  const end = vi
+    .spyOn(h.manager, "endCall")
+    .mockResolvedValueOnce({ success: false, error: "transient" });
+  await replacement.retireRestoredCalls();
+  end.mockRestore();
+  await h.provider.stop();
+  await replacement.retryPendingCleanup();
+  expect((replacement as unknown as { restoredCleanup: Set<string> }).restoredCleanup.size).toBe(0);
+  await replacement.stop();
   await h.handler.close();
 });
