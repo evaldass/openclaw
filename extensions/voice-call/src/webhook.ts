@@ -719,7 +719,7 @@ export class VoiceCallWebhookServer {
         remoteAddress: req.socket.remoteAddress ?? undefined,
       };
 
-      const verification = this.provider.verifyWebhook(ctx);
+      const verification = await this.provider.verifyWebhook(ctx);
       if (!verification.ok) {
         this.logger.warn(`Webhook verification failed: ${verification.reason}`);
         return { statusCode: 401, body: "Unauthorized" };

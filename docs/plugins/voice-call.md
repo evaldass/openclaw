@@ -1,5 +1,5 @@
 ---
-summary: "Place outbound and accept inbound voice calls via Twilio, Telnyx, or Plivo, with optional realtime voice and streaming transcription"
+summary: "Place outbound and accept inbound voice calls via LiveKit, Plivo, Telnyx, or Twilio, with optional realtime voice and streaming transcription"
 read_when:
   - You want to place an outbound voice call from OpenClaw
   - You are configuring or developing the voice-call plugin
@@ -12,7 +12,7 @@ Voice calls for OpenClaw via a plugin: outbound notifications, multi-turn
 conversations, full-duplex realtime voice, streaming transcription, and
 inbound calls with allowlist policies.
 
-**Providers:** `mock` (dev, no network), `plivo` (Voice API + XML transfer +
+**Providers:** `livekit` (SIP trunks + native RTC rooms), `mock` (dev, no network), `plivo` (Voice API + XML transfer +
 GetInput speech), `telnyx` (Call Control v2), `twilio` (Programmable Voice +
 Media Streams).
 

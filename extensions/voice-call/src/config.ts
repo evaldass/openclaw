@@ -28,6 +28,29 @@ const InboundPolicySchema = z.enum(["disabled", "allowlist", "pairing", "open"])
 
 const SecretInputSchema = buildSecretInputSchema();
 
+const LiveKitConfigSchema = z
+  .object({
+    url: z
+      .string()
+      .url()
+      .refine((value) => {
+        const url = new URL(value);
+        return (
+          url.protocol === "wss:" && !url.username && !url.password && !url.search && !url.hash
+        );
+      }, "LiveKit requires a wss:// server URL without embedded credentials or tokens"),
+    apiKey: SecretInputSchema.optional(),
+    apiSecret: SecretInputSchema.optional(),
+    outboundTrunkId: z.string().min(1),
+    inboundTrunkIds: z.array(z.string().min(1)).min(1),
+    roomPrefix: z
+      .string()
+      .regex(/^[a-zA-Z0-9_-]{1,40}$/)
+      .default("openclaw-call-"),
+  })
+  .strict();
+export type LiveKitConfig = z.infer<typeof LiveKitConfigSchema>;
+
 const TelnyxConfigSchema = z
   .object({
     apiKey: z.string().min(1).optional(),
@@ -280,8 +303,9 @@ export const VoiceCallConfigSchema = z
   .object({
     enabled: z.boolean().default(false),
 
-    provider: z.enum(["telnyx", "twilio", "plivo", "mock"]).optional(),
+    provider: z.enum(["livekit", "telnyx", "twilio", "plivo", "mock"]).optional(),
 
+    livekit: LiveKitConfigSchema.optional(),
     telnyx: TelnyxConfigSchema.optional(),
 
     twilio: TwilioConfigSchema.optional(),
@@ -564,6 +588,7 @@ export function normalizeVoiceCallConfig(config: VoiceCallConfigInput): VoiceCal
   return {
     ...defaults,
     ...config,
+    livekit: config.livekit ? LiveKitConfigSchema.parse(config.livekit) : undefined,
     allowFrom: config.allowFrom ?? defaults.allowFrom,
     numbers: sanitizeVoiceCallNumberRoutes(
       (config.numbers ?? defaults.numbers) as Record<string, unknown>,
@@ -758,6 +783,15 @@ export function validateProviderConfig(config: VoiceCallConfig): {
       );
     }
   };
+  if (config.provider === "livekit") {
+    if (!config.livekit) errors.push("LiveKit configuration is required");
+    if (!hasConfiguredSecretInput(config.livekit?.apiKey))
+      errors.push("livekit.apiKey is required");
+    if (!hasConfiguredSecretInput(config.livekit?.apiSecret))
+      errors.push("livekit.apiSecret is required");
+    if (!config.realtime.enabled) errors.push("LiveKit requires realtime.enabled");
+    if (config.skipSignatureVerification) errors.push("LiveKit requires signed webhooks");
+  }
   if (config.provider === "telnyx") {
     requireCredential("apiKey", config.telnyx?.apiKey, "TELNYX_API_KEY");
     requireCredential("connectionId", config.telnyx?.connectionId, "TELNYX_CONNECTION_ID");
@@ -801,10 +835,11 @@ export function validateProviderConfig(config: VoiceCallConfig): {
     config.provider &&
     config.provider !== "twilio" &&
     config.provider !== "telnyx" &&
+    config.provider !== "livekit" &&
     config.provider !== "mock"
   ) {
     errors.push(
-      'plugins.entries.voice-call.config.provider must be "twilio", "telnyx", or "mock" when realtime.enabled is true',
+      'plugins.entries.voice-call.config.provider must be "livekit", "twilio", "telnyx", or "mock" when realtime.enabled is true',
     );
   }
 

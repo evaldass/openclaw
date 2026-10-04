@@ -84,6 +84,7 @@ function createRuntimeResourceLifecycle(params: {
   config: VoiceCallConfig;
   webhookServer: VoiceCallWebhookServer;
   manager: CallManager;
+  provider: VoiceCallProvider;
 }): {
   setTunnelResult: (result: TunnelResult | null) => void;
   stop: (opts?: { suppressErrors?: boolean }) => Promise<void>;
@@ -107,6 +108,7 @@ function createRuntimeResourceLifecycle(params: {
             await tunnelResult?.stop();
           },
           () => cleanupTailscaleExposure(params.config),
+          () => params.provider.stop?.(),
           () => params.webhookServer.stop(),
           () => params.manager.stop(),
         ]) {
@@ -132,6 +134,10 @@ async function resolveProvider(config: VoiceCallConfig): Promise<VoiceCallProvid
     (config.tunnel?.allowNgrokFreeTierLoopbackBypass ?? false);
 
   switch (config.provider) {
+    case "livekit": {
+      const { LiveKitProvider } = await import("./providers/livekit.js");
+      return new LiveKitProvider(config.livekit!);
+    }
     case "telnyx": {
       const { TelnyxProvider } = await import("./providers/telnyx.js");
       return new TelnyxProvider(
@@ -438,7 +444,7 @@ export async function createVoiceCallRuntime(params: {
     }
     webhookServer.setRealtimeHandler(realtimeHandler);
   }
-  const lifecycle = createRuntimeResourceLifecycle({ config, webhookServer, manager });
+  const lifecycle = createRuntimeResourceLifecycle({ config, webhookServer, manager, provider });
 
   const localUrl = await webhookServer.start();
 
@@ -531,6 +537,14 @@ export async function createVoiceCallRuntime(params: {
     }
 
     await manager.initialize(provider, webhookUrl);
+    if (provider.name === "livekit") {
+      const { LiveKitProvider } = await import("./providers/livekit.js");
+      const handler = webhookServer.getRealtimeHandler();
+      if (!handler || !(provider instanceof LiveKitProvider))
+        throw new Error("LiveKit realtime bridge unavailable");
+      provider.bind(manager, handler);
+      await provider.retireRestoredCalls();
+    }
 
     log.info("[voice-call] Runtime initialized");
     log.info(`[voice-call] Webhook URL: ${webhookUrl}`);
