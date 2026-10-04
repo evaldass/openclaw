@@ -18,6 +18,7 @@ import {
 import type { SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { RuntimeLogger, PluginRuntimeCore } from "../plugins/runtime/types-core.js";
+import { runWithGatewayDetachedWorkAdmission } from "../process/gateway-work-admission.js";
 import { parseAgentSessionKey } from "../routing/session-key.js";
 import { isModelSelectionLocked, ModelSelectionLockedError } from "../sessions/model-overrides.js";
 import { deliveryContextFromSession } from "../utils/delivery-context.read.js";
@@ -405,6 +406,19 @@ export async function consultRealtimeVoiceAgent(params: {
     timeoutMs: number;
   }) => RealtimeVoiceAgentConsultRunRegistration | void;
 }): Promise<RealtimeVoiceAgentConsultResult> {
+  // RTC callbacks can inherit the released voicecall.start request root. Each
+  // delegated turn is new work, not a continuation of that request; admit it
+  // behind the current restart/suspension fences and own its async cleanup.
+  return await runWithGatewayDetachedWorkAdmission(
+    () => runRealtimeVoiceAgentConsult(params),
+    "realtime-voice:consult",
+    params.abortSignal,
+  );
+}
+
+async function runRealtimeVoiceAgentConsult(
+  params: Parameters<typeof consultRealtimeVoiceAgent>[0],
+): Promise<RealtimeVoiceAgentConsultResult> {
   params.abortSignal?.throwIfAborted();
   const [{ beginSessionWorkAdmission }, { resolveSessionWorkStartError }] = await Promise.all([
     import("../sessions/session-lifecycle-admission.js"),
