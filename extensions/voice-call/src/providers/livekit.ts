@@ -484,7 +484,11 @@ export class LiveKitProvider implements VoiceCallProvider {
       );
       await Promise.allSettled(this.operations);
       await this.retryPendingCleanup();
-      if (this.cleanupFailed || cleanup.some((result) => result.status === "rejected")) {
+      if (
+        this.pendingCleanup.size > 0 ||
+        this.cleanupFailed ||
+        cleanup.some((result) => result.status === "rejected")
+      ) {
         throw new Error("LiveKit room cleanup failed during shutdown");
       }
     })();

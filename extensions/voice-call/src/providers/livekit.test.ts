@@ -24,6 +24,7 @@ import {
   createTestStorePath,
   installVoiceCallStateRuntimeForTests,
   registerTestManagerCleanup,
+  FakeProvider,
 } from "../manager.test-harness.js";
 import type { CallRecord, WebhookContext } from "../types.js";
 import { RealtimeCallHandler } from "../webhook/realtime-handler.js";
@@ -587,4 +588,48 @@ it("ignores invalid inactive LiveKit partial config at normalization boundary", 
   expect(() =>
     normalizeVoiceCallConfig({ provider: "livekit", livekit: { url: "invalid" } }),
   ).toThrow();
+});
+
+it.each(["twilio", "telnyx", "plivo"] as const)(
+  "preserves %s inbound admission beyond outbound-only cap",
+  async (name) => {
+    const h = await harness();
+    const provider = new FakeProvider(name);
+    await h.manager.initialize(provider, "https://voice.example.test/webhook");
+    for (let i = 0; i < 2; i++)
+      await h.manager.processEvent({
+        id: `${name}-${i}`,
+        type: "call.initiated",
+        callId: `${name}-${i}`,
+        providerCallId: `${name}-${i}`,
+        timestamp: Date.now(),
+        direction: "inbound",
+        from,
+        to,
+      });
+    expect(h.manager.getActiveCalls()).toHaveLength(2);
+    expect(provider.hangupCalls).toHaveLength(0);
+    await h.provider.stop();
+    await h.handler.close();
+  },
+);
+
+it("reports pending restored cleanup at shutdown even when endCall fails before deleteRoom", async () => {
+  const h = await harness();
+  await h.manager.initiateCall(to, undefined, { mode: "conversation" });
+  const replacement = new LiveKitProvider(livekit, {
+    rooms: h.rooms,
+    sip: h.sip,
+    receiver: h.receiver,
+    connectAudio: h.connectAudio,
+  });
+  replacement.bind(h.manager, h.handler);
+  const end = vi
+    .spyOn(h.manager, "endCall")
+    .mockResolvedValue({ success: false, error: "pre-delete failure" });
+  await replacement.retireRestoredCalls();
+  await expect(replacement.stop()).rejects.toThrow("cleanup failed during shutdown");
+  end.mockRestore();
+  await h.provider.stop();
+  await h.handler.close();
 });

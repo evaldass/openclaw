@@ -281,3 +281,9 @@ cache capacity never disables admission of a new call. Long silent/DTX periods
 still require live acceptance testing against the existing realtime media-inactivity
 policy; offline tests do not establish that a particular SIP deployment emits
 continuous silence frames.
+
+For LiveKit only, `maxConcurrentCalls` also caps inbound admission. Existing
+Plivo, Telnyx, and Twilio inbound admission behavior is unchanged. LiveKit playback
+progress marks confirm a native queue prefix using the SDK's millisecond queue
+estimate, not the full utterance drain; clear/barge-in and close cancel pending
+mark timers before another audio generation can acknowledge them.
