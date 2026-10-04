@@ -328,18 +328,42 @@ describe("validateProviderConfig", () => {
   });
 
   describe("realtime config", () => {
-    it("rejects disabled inbound policy for realtime mode", () => {
-      const config = createBaseConfig("twilio");
-      config.realtime.enabled = true;
-      config.inboundPolicy = "disabled";
-
-      const result = validateProviderConfig(config);
-
-      expect(result.valid).toBe(false);
-      expect(result.errors).toContain(
-        'plugins.entries.voice-call.config.inboundPolicy must not be "disabled" when realtime.enabled is true',
-      );
+    it("allows a complete outbound-only LiveKit realtime configuration", () => {
+      const config = VoiceCallConfigSchema.parse({
+        enabled: true,
+        provider: "livekit",
+        fromNumber: "+15550000001",
+        inboundPolicy: "disabled",
+        realtime: { enabled: true },
+        livekit: {
+          url: "ws://10.10.2.186:7880",
+          allowInsecureWs: true,
+          apiKey: "***",
+          apiSecret: "synthetic-livekit-secret-for-offline-tests",
+          outboundTrunkId: "ST_out",
+          inboundTrunkIds: ["ST_in"],
+        },
+      });
+      expect(validateProviderConfig(config)).toEqual({ valid: true, errors: [] });
+      config.skipSignatureVerification = true;
+      expect(validateProviderConfig(config).errors).toContain("LiveKit requires signed webhooks");
     });
+
+    it.each(["twilio", "telnyx", "plivo", "mock"] as const)(
+      "rejects disabled inbound policy for %s realtime mode",
+      (provider) => {
+        const config = createBaseConfig(provider);
+        config.realtime.enabled = true;
+        config.inboundPolicy = "disabled";
+
+        const result = validateProviderConfig(config);
+
+        expect(result.valid).toBe(false);
+        expect(result.errors).toContain(
+          'plugins.entries.voice-call.config.inboundPolicy must not be "disabled" when realtime.enabled is true',
+        );
+      },
+    );
 
     it("rejects enabling realtime and streaming together", () => {
       const config = createBaseConfig("twilio");
