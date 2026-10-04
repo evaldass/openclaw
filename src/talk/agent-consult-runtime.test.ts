@@ -1,3 +1,4 @@
+import { AsyncResource } from "node:async_hooks";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +11,14 @@ import {
   emitTrustedDiagnosticEvent,
   waitForDiagnosticEventsDrained,
 } from "../infra/diagnostic-events.js";
+import {
+  getActiveGatewayRootWorkCount,
+  isGatewaySubordinateWorkAdmissionClosed,
+  markGatewayRestartDraining,
+  resetGatewayWorkAdmission,
+  tryBeginGatewayRootWorkAdmission,
+  tryBeginGatewaySuspendAdmission,
+} from "../process/gateway-work-admission.js";
 import { MODEL_SELECTION_LOCKED_MESSAGE } from "../sessions/model-overrides.js";
 import { runExclusiveSessionLifecycleMutation } from "../sessions/session-lifecycle-admission.js";
 import { captureEnv, setTestEnvValue } from "../test-utils/env.js";
@@ -168,6 +177,7 @@ function expectNonEmptyString(value: unknown) {
 
 describe("realtime voice agent consult runtime", () => {
   beforeEach(async () => {
+    resetGatewayWorkAdmission();
     sessionForkMocks.forkSessionEntryFromParent.mockImplementation(async (params) => {
       const actual = await vi.importActual<typeof import("../auto-reply/reply/session-fork.js")>(
         "../auto-reply/reply/session-fork.js",
@@ -183,6 +193,7 @@ describe("realtime voice agent consult runtime", () => {
   });
 
   afterEach(async () => {
+    resetGatewayWorkAdmission();
     sessionForkMocks.forkSessionEntryFromParent.mockReset();
     const tempDir = testTempDir;
     testTempDir = undefined;
@@ -193,6 +204,86 @@ describe("realtime voice agent consult runtime", () => {
       await fs.rm(tempDir, { recursive: true, force: true });
     }
   });
+
+  it("admits a delayed RTC consult after the voicecall.start root has released", async () => {
+    const root = tryBeginGatewayRootWorkAdmission("rpc:voicecall.start")!;
+    const rtc = await root.run(async () => new AsyncResource("voice-call-rtc"));
+    root.release();
+    const { runtime, runEmbeddedAgent } = createAgentRuntime();
+    const completed = createDeferred();
+    const started = createDeferred();
+    runEmbeddedAgent.mockImplementationOnce(async () => {
+      expect(isGatewaySubordinateWorkAdmissionClosed()).toBe(false);
+      expect(getActiveGatewayRootWorkCount()).toBe(1);
+      started.resolve();
+      await completed.promise;
+      return { payloads: [{ text: "Checked." }], meta: {} };
+    });
+    try {
+      const consult = rtc.runInAsyncScope(() => {
+        expect(isGatewaySubordinateWorkAdmissionClosed()).toBe(true);
+        return runConsult({
+          agentRuntime: runtime as never,
+          sessionKey: "voice:rtc",
+          runIdPrefix: "voice-realtime-consult:rtc",
+          args: { question: "Check this" },
+        });
+      });
+      await Promise.race([started.promise, consult]);
+      const suspension = tryBeginGatewaySuspendAdmission(() => {})!;
+      expect(getActiveGatewayRootWorkCount()).toBe(1);
+      completed.resolve();
+      await expect(consult).resolves.toEqual({ text: "Checked." });
+      expect(getActiveGatewayRootWorkCount()).toBe(0);
+      suspension.rollback();
+    } finally {
+      completed.resolve();
+      rtc.emitDestroy();
+    }
+  });
+
+  it.each(["suspension", "restart"] as const)(
+    "does not admit a delayed RTC consult across %s",
+    async (fence) => {
+      const root = tryBeginGatewayRootWorkAdmission("rpc:voicecall.start")!;
+      const rtc = await root.run(async () => new AsyncResource("voice-call-rtc"));
+      root.release();
+      const { runtime, runEmbeddedAgent } = createAgentRuntime();
+      const controller = new AbortController();
+      const suspension = fence === "suspension" ? tryBeginGatewaySuspendAdmission(() => {}) : null;
+      if (fence === "restart") {
+        markGatewayRestartDraining();
+      }
+      try {
+        const consult = rtc.runInAsyncScope(() =>
+          runConsult({
+            agentRuntime: runtime as never,
+            sessionKey: "voice:fenced",
+            runIdPrefix: "voice-realtime-consult:fenced",
+            args: { question: "Check this" },
+            abortSignal: controller.signal,
+          }),
+        );
+        if (fence === "suspension") {
+          controller.abort(new Error("call ended while paused"));
+        }
+        if (fence === "suspension") {
+          await expect(consult).rejects.toMatchObject({
+            name: "AbortError",
+            cause: controller.signal.reason,
+          });
+        } else {
+          await expect(consult).rejects.toThrow("Gateway is restarting");
+        }
+        expect(runEmbeddedAgent).not.toHaveBeenCalled();
+        expect(runtime.ensureAgentWorkspace).not.toHaveBeenCalled();
+        expect(getActiveGatewayRootWorkCount()).toBe(0);
+      } finally {
+        suspension?.rollback();
+        rtc.emitDestroy();
+      }
+    },
+  );
 
   it("exposes the supported sender authentication revision", () => {
     expect(REALTIME_VOICE_AGENT_CONSULT_SENDER_AUTH_VERSION).toBe(1);
