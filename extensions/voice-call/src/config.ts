@@ -833,7 +833,11 @@ export function validateProviderConfig(config: VoiceCallConfig): {
     requireCredential("authToken", config.plivo?.authToken, "PLIVO_AUTH_TOKEN");
   }
 
-  if (config.realtime.enabled && config.inboundPolicy === "disabled") {
+  if (
+    config.realtime.enabled &&
+    config.inboundPolicy === "disabled" &&
+    config.provider !== "livekit"
+  ) {
     errors.push(
       'plugins.entries.voice-call.config.inboundPolicy must not be "disabled" when realtime.enabled is true',
     );
