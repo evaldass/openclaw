@@ -31,9 +31,11 @@ export async function connectLiveKitAudio(
   let generation = 0;
   let bufferedAmount = 0;
   let output = Promise.resolve();
-  let capturedSamples = 0;
-  let playedSamples = 0;
-  const marks = new Set<Promise<void>>();
+  const marks = new Set<ReturnType<typeof setTimeout>>();
+  const clearMarks = () => {
+    for (const timer of marks) clearTimeout(timer);
+    marks.clear();
+  };
   let closePromise: Promise<void> | undefined;
   let connectPromise: Promise<void> | undefined;
   const readers = new Set<ReadableStreamDefaultReader<InstanceType<typeof rtc.AudioFrame>>>();
@@ -44,6 +46,7 @@ export async function connectLiveKitAudio(
     if (closePromise) return closePromise;
     closed = true;
     generation++;
+    clearMarks();
     binding?.endCall();
     room.removeAllListeners();
     closePromise = (async () => {
@@ -52,7 +55,7 @@ export async function connectLiveKitAudio(
       await room.disconnect();
       await output.catch(() => {});
       await source.close();
-      await Promise.allSettled(marks);
+
       await Promise.allSettled(tasks);
     })();
     return closePromise;
@@ -84,8 +87,7 @@ export async function connectLiveKitAudio(
       if (frame.event === "clear") {
         generation++;
         source.clearQueue();
-        capturedSamples = 0;
-        playedSamples = 0;
+        clearMarks();
         return;
       }
       const owner = generation;
@@ -99,11 +101,6 @@ export async function connectLiveKitAudio(
             try {
               if (current() && owner === generation) {
                 await source.captureFrame(new rtc.AudioFrame(samples, 8000, 1, samples.length));
-                capturedSamples += samples.length;
-                playedSamples = Math.max(
-                  playedSamples,
-                  capturedSamples - source.queuedDuration * 8000,
-                );
               }
             } finally {
               bufferedAmount -= pcm.length;
@@ -112,21 +109,20 @@ export async function connectLiveKitAudio(
           .catch(disconnected);
       } else if (frame.event === "mark" && frame.mark) {
         const name = frame.mark.name;
-        // Snapshot the captured prefix, but never place playout waits on the
-        // capture chain: model deltas must continue feeding the native queue.
-        const mark = output
-          .then(async () => {
+        // Capture ordering fixes the mark's native queue position. queuedDuration
+        // is milliseconds; later captures re-arm the SDK drain waiter, so never
+        // use waitForPlayout for a prefix acknowledgement.
+        void output
+          .then(() => {
             if (!current() || owner !== generation) return;
-            const boundary = capturedSamples;
-            await source.waitForPlayout();
-            if (current() && owner === generation) {
-              playedSamples = Math.max(playedSamples, boundary);
-              if (playedSamples >= boundary) binding?.acknowledgeMark(name);
-            }
+            const delayMs = Math.max(0, Math.ceil(source.queuedDuration));
+            const timer = setTimeout(() => {
+              marks.delete(timer);
+              if (current() && owner === generation) binding?.acknowledgeMark(name);
+            }, delayMs);
+            marks.add(timer);
           })
           .catch(disconnected);
-        marks.add(mark);
-        void mark.finally(() => marks.delete(mark));
       }
     },
   };

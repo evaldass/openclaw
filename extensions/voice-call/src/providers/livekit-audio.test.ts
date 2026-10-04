@@ -1,12 +1,15 @@
 import type { EventEmitter } from "node:events";
 import { convertPcmToMulaw8k } from "openclaw/plugin-sdk/realtime-voice";
 import { afterEach, expect, it, vi } from "vitest";
+import { RealtimeAudioPacer } from "../webhook/realtime-audio-pacer.js";
 import type { RealtimeMediaTransport } from "../webhook/realtime-handler.js";
+import { StreamFrameAdapter } from "../webhook/stream-frame-adapter.js";
 import { connectLiveKitAudio, type LiveKitAudioParams } from "./livekit-audio.js";
 
 const mock = vi.hoisted(() => ({
   capture: vi.fn(async (_frame: { data: Int16Array }) => {}),
   playout: vi.fn(async () => {}),
+  queueMs: 0,
   clear: vi.fn(),
   close: vi.fn(async () => {}),
   publish: vi.fn(async () => {}),
@@ -47,7 +50,9 @@ vi.mock("@livekit/rtc-node", async () => {
       clearQueue = mock.clear;
       close = mock.close;
       waitForPlayout = mock.playout;
-      queuedDuration = 0;
+      get queuedDuration() {
+        return mock.queueMs;
+      }
     },
     AudioFrame: class {
       constructor(
@@ -197,27 +202,37 @@ it("rejects manager cancellation during RTC admission", async () => {
   expect(h.params.handler.attachRoomTransport).not.toHaveBeenCalled();
 });
 
-it("does not block later media captures while a playback mark waits", async () => {
-  let release!: () => void;
-  mock.playout.mockImplementationOnce(
-    () =>
-      new Promise<void>((resolve) => {
-        release = resolve;
-      }),
-  );
+it("acknowledges a 160ms prefix during sustained captures and cancels stale marks on clear/close", async () => {
+  vi.useFakeTimers();
   const h = harness();
   const connection = await connectLiveKitAudio(h.params);
-  const media = JSON.stringify({ event: "media", media: { payload: "////" } });
-  h.transport().send(media);
-  h.transport().send(JSON.stringify({ event: "mark", mark: { name: "delayed" } }));
-  h.transport().send(media);
-  for (let i = 0; i < 12; i++) await Promise.resolve();
-  expect(mock.capture).toHaveBeenCalledTimes(2);
-  expect(h.acknowledgeMark).not.toHaveBeenCalled();
-  release();
-  await h.playedPromise;
-  expect(h.acknowledgeMark).toHaveBeenCalledWith("delayed");
-  await connection.close();
+  try {
+    mock.queueMs = 160;
+    const media = JSON.stringify({ event: "media", media: { payload: "////" } });
+    h.transport().send(media);
+    h.transport().send(JSON.stringify({ event: "mark", mark: { name: "prefix" } }));
+    for (let i = 0; i < 8; i++) {
+      h.transport().send(media);
+      await vi.advanceTimersByTimeAsync(20);
+    }
+    expect(mock.capture).toHaveBeenCalledTimes(9);
+    expect(h.acknowledgeMark).toHaveBeenCalledWith("prefix");
+    expect(mock.playout).not.toHaveBeenCalled();
+    h.transport().send(JSON.stringify({ event: "mark", mark: { name: "cleared" } }));
+    await vi.advanceTimersByTimeAsync(0);
+    h.transport().send(JSON.stringify({ event: "clear" }));
+    await vi.advanceTimersByTimeAsync(200);
+    expect(h.acknowledgeMark).not.toHaveBeenCalledWith("cleared");
+    h.transport().send(JSON.stringify({ event: "mark", mark: { name: "closed" } }));
+    await vi.advanceTimersByTimeAsync(0);
+    await connection.close();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(h.acknowledgeMark).not.toHaveBeenCalledWith("closed");
+  } finally {
+    await connection.close();
+    mock.queueMs = 0;
+    vi.useRealTimers();
+  }
 });
 
 it.each([1008, 1011, 1013])("propagates transport error close %s", async (code) => {
@@ -226,4 +241,38 @@ it.each([1008, 1011, 1013])("propagates transport error close %s", async (code) 
   h.transport().close(code);
   expect(h.onDisconnect).toHaveBeenCalledWith("error");
   await connection.close();
+});
+
+it("advances pacer truncation position mid-response and clears pending generation marks", async () => {
+  vi.useFakeTimers();
+  const h = harness();
+  const connection = await connectLiveKitAudio(h.params);
+  const pacer = new RealtimeAudioPacer({
+    serializer: new StreamFrameAdapter("twilio"),
+    send: (raw) => {
+      h.transport().send(raw);
+      return true;
+    },
+  });
+  h.acknowledgeMark.mockImplementation((name) => {
+    pacer.acknowledgeMark(name);
+  });
+  try {
+    mock.queueMs = 160;
+    pacer.sendAudio(Buffer.alloc(8000, 255), { itemId: "assistant-turn" });
+    await vi.advanceTimersByTimeAsync(500);
+    const played = pacer.getPlaybackState()[0]!.audioEndMs;
+    expect(played).toBeGreaterThanOrEqual(250);
+    expect(played).toBeLessThan(1000);
+    const count = h.acknowledgeMark.mock.calls.length;
+    pacer.clearAudio();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(h.acknowledgeMark.mock.calls).toHaveLength(count);
+    expect(pacer.getPlaybackState()).toEqual([]);
+  } finally {
+    pacer.close();
+    await connection.close();
+    mock.queueMs = 0;
+    vi.useRealTimers();
+  }
 });

@@ -219,7 +219,7 @@ async function processEventInQueue(
     if (
       event.direction === "inbound" &&
       (!shouldAcceptInbound(ctx.config, event.from) ||
-        ctx.activeCalls.size >= ctx.config.maxConcurrentCalls)
+        (ctx.provider?.name === "livekit" && ctx.activeCalls.size >= ctx.config.maxConcurrentCalls))
     ) {
       const pid = providerCallId;
       if (!ctx.provider) {
