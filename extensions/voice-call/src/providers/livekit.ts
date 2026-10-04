@@ -78,7 +78,9 @@ export class LiveKitProvider implements VoiceCallProvider {
       "";
     if (!this.apiKey || !this.apiSecret)
       throw new Error("LiveKit server credentials are not resolved");
-    const host = config.url.replace(/^wss:/, "https:");
+    const host = config.url.replace(/^ws(s?):/i, (_match, secure: string) =>
+      secure ? "https:" : "http:",
+    );
     this.deps = deps ?? {
       rooms: new RoomServiceClient(host, this.apiKey, this.apiSecret),
       sip: new SipClient(host, this.apiKey, this.apiSecret),

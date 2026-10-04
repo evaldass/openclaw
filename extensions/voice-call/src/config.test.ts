@@ -1,4 +1,9 @@
 // Voice Call tests cover config plugin behavior.
+import fs from "node:fs";
+import {
+  validateJsonSchemaValue,
+  type JsonSchemaObject,
+} from "openclaw/plugin-sdk/json-schema-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   VoiceCallConfigSchema,
@@ -923,5 +928,80 @@ describe("resolveVoiceCallConfig realtime settings", () => {
     });
 
     expect(resolved.responseModel).toBeUndefined();
+  });
+});
+
+describe("LiveKit server transport", () => {
+  const manifest = JSON.parse(
+    fs.readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"),
+  ) as { configSchema: JsonSchemaObject };
+  const validateManifest = (livekit: unknown) =>
+    validateJsonSchemaValue({
+      cacheKey: "voice-call.manifest.livekit-transport.test",
+      schema: manifest.configSchema,
+      value: { livekit },
+      applyDefaults: true,
+    }).ok;
+
+  const livekit = {
+    url: "wss://livekit.example.test",
+    outboundTrunkId: "ST_out",
+    inboundTrunkIds: ["ST_in"],
+  };
+  it("defaults to secure transport without an insecure opt-in", () => {
+    expect(VoiceCallConfigSchema.parse({ livekit }).livekit?.allowInsecureWs).toBe(false);
+    expect(validateManifest(livekit)).toBe(true);
+    expect(validateManifest({ ...livekit, url: "ws://10.10.2.186:7880" })).toBe(false);
+    expect(
+      VoiceCallConfigSchema.safeParse({
+        livekit: { ...livekit, url: "ws://10.10.2.186:7880" },
+      }).success,
+    ).toBe(false);
+  });
+  it.each([
+    "ws://10.10.2.186:7880",
+    "ws://127.0.0.1:7880",
+    "ws://172.16.0.1:7880",
+    "ws://172.31.255.254:7880",
+    "ws://192.168.1.2:7880",
+    "ws://[::1]:7880",
+    "ws://[fc00::1]:7880",
+    "ws://[fd12:3456::1]:7880",
+  ])("allows explicit trusted-network opt-in for %s", (url) => {
+    expect(validateManifest({ ...livekit, url, allowInsecureWs: true })).toBe(true);
+    expect(
+      VoiceCallConfigSchema.safeParse({
+        livekit: { ...livekit, url, allowInsecureWs: true },
+      }).success,
+    ).toBe(true);
+  });
+  it.each([
+    "ws://localhost:7880",
+    "ws://livekit.internal:7880",
+    "ws://8.8.8.8:7880",
+    "ws://172.15.255.255:7880",
+    "ws://172.32.0.1:7880",
+    "ws://169.254.1.1:7880",
+    "ws://100.64.0.1:7880",
+    "ws://0.0.0.0:7880",
+    "ws://[::]:7880",
+    "ws://[2001:db8::1]:7880",
+    "ws://[fe80::1]:7880",
+    "ws://[::ffff:10.0.0.1]:7880",
+    "http://10.10.2.186:7880",
+    "https://livekit.example.test",
+    "ws://user:pass@10.10.2.186:7880",
+    "ws://10.10.2.186:7880?token=synthetic",
+    "ws://10.10.2.186:7880#token",
+    "wss://user:pass@livekit.example.test",
+    "wss://livekit.example.test?token=synthetic",
+    "wss://livekit.example.test#token",
+  ])("rejects unsafe URLs even with opt-in: %s", (url) => {
+    expect(validateManifest({ ...livekit, url, allowInsecureWs: true })).toBe(false);
+    expect(
+      VoiceCallConfigSchema.safeParse({
+        livekit: { ...livekit, url, allowInsecureWs: true },
+      }).success,
+    ).toBe(false);
   });
 });

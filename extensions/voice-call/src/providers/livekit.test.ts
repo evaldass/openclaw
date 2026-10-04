@@ -62,6 +62,7 @@ vi.mock("../manager/store.js", () => {
 
 const livekit = {
   url: "wss://livekit.example.test",
+  allowInsecureWs: false,
   apiKey: "test-key",
   apiSecret: "synthetic-livekit-secret-for-offline-tests",
   outboundTrunkId: "ST_out",
@@ -102,7 +103,7 @@ function context(event: WebhookEvent): WebhookContext {
   };
 }
 
-async function harness(policy: "open" | "allowlist" = "open") {
+async function harness(policy: "open" | "allowlist" = "open", server = livekit) {
   let participants: Array<{ identity: string; sid: string; kind: number }> = [
     { identity: "sip-inbound", sid: "PA_in", kind: 3 },
   ];
@@ -131,12 +132,12 @@ async function harness(policy: "open" | "allowlist" = "open") {
       WebhookEvent.fromJsonString(body),
     ),
   };
-  const provider = new LiveKitProvider(livekit, { rooms, sip, receiver, connectAudio });
+  const provider = new LiveKitProvider(server, { rooms, sip, receiver, connectAudio });
   const config = VoiceCallConfigSchema.parse({
     enabled: true,
     agentId: "main",
     provider: "livekit",
-    livekit,
+    livekit: server,
     fromNumber: from,
     inboundPolicy: policy,
     allowFrom: [],
@@ -199,6 +200,27 @@ async function harness(policy: "open" | "allowlist" = "open") {
 afterEach(() => vi.restoreAllMocks());
 
 describe("LiveKit telephony lifecycle", () => {
+  it("preserves the opted-in WS URL for native RTC while retaining call cleanup", async () => {
+    const h = await harness("open", {
+      ...livekit,
+      url: "ws://10.10.2.186:7880",
+      allowInsecureWs: true,
+    });
+    const started = await h.manager.initiateCall(to, undefined, { mode: "conversation" });
+    expect(started.success).toBe(true);
+    expect(h.connectAudio).toHaveBeenCalledWith(
+      expect.objectContaining({
+        url: "ws://10.10.2.186:7880",
+        callId: started.callId,
+        token: expect.any(String),
+      }),
+    );
+    await h.manager.endCall(started.callId);
+    await h.handler.close();
+    await h.provider.stop();
+    expect(h.close).toHaveBeenCalledOnce();
+  });
+
   it("attaches RTC to the existing realtime owner with call-bound native agent delegation", async () => {
     const h = await harness();
     const started = await h.manager.initiateCall(to, undefined, { mode: "conversation" });
