@@ -5,10 +5,7 @@ import {
   getAgentEventLifecycleGeneration,
   isAgentEventLifecycleGenerationCurrent,
 } from "../../../infra/agent-events.js";
-import {
-  bindGatewayContextResolver,
-  getGatewayContextResolver as getEntryGatewayContextResolver,
-} from "../../../plugins/runtime/gateway-request-scope.js";
+import { getGatewayContextResolver as getEntryGatewayContextResolver } from "../../../plugins/runtime/gateway-request-scope.js";
 import {
   runWithGatewayIndependentRootWorkAdmission,
   GatewayDrainingError,
@@ -27,16 +24,15 @@ import { updateSubagentArchiveAtMs } from "./subagent-registry-helpers.js";
 import type { SubagentLifecycleController } from "./subagent-registry-lifecycle.js";
 import {
   getCurrentSubagentRunOwner,
-  subagentRuns,
   waitForSubagentRetirementPublication,
 } from "./subagent-registry-memory.js";
 import {
   assertSubagentRegistryWriteSourceCurrent,
   mutateSubagentRuns,
   restoreSubagentRunsFromDisk,
-  SubagentRegistryMutationRejectedError,
 } from "./subagent-registry-persistence.js";
 import { getLatestSubagentRunForChild } from "./subagent-registry-queries.js";
+import { selectRequesterTurnChildren } from "./subagent-registry-requester-yield.js";
 import { isRetiredSubagentSessionOwner } from "./subagent-registry-restart-recovery-helpers.js";
 import type { SubagentRunRecord } from "./subagent-registry.types.js";
 import { getSubagentRunRuntimeKey, isSameSubagentRunOwner } from "./subagent-run-generation.js";
@@ -50,42 +46,6 @@ const RESTORE_RETRY_MAX_DELAY_MS = 30_000;
 
 export function isRestoredQueuedFailureSettlementClaimed(entry: SubagentRunRecord): boolean {
   return restoredQueuedFailureSettlementClaims.has(getSubagentRunRuntimeKey(entry));
-}
-
-/** A closed Gateway's durable terminal wake acquires fresh host custody, never its old aliases. */
-export async function recoverSubagentRunGatewayOwner(
-  expected: SubagentRunRecord,
-  resolver: GatewayContextResolver,
-  onRecovered: (entry: SubagentRunRecord) => void,
-): Promise<boolean> {
-  const previousResolver = getEntryGatewayContextResolver(expected);
-  const gateway = resolver();
-  if (!previousResolver || previousResolver() !== undefined || !gateway) {
-    return false;
-  }
-  return mutateSubagentRuns(
-    [expected.runId],
-    (rows) => {
-      const current = rows.get(expected.runId);
-      if (!current) {
-        throw new SubagentRegistryMutationRejectedError(
-          "Subagent Gateway recovery row disappeared",
-        );
-      }
-      return { value: true, postimages: new Map([[current.runId, structuredClone(current)]]) };
-    },
-    {
-      gatewayRecovery: { expected, previousResolver, resolver, gateway },
-      onPublished: (postimages) => {
-        const row = postimages.get(expected.runId);
-        if (row) {
-          bindGatewayContextResolver(row, resolver);
-          onRecovered(row);
-          subagentRuns.commitOwnership(row);
-        }
-      },
-    },
-  );
 }
 
 export function createSubagentRegistryRestorer(config: {
@@ -228,37 +188,43 @@ export function createSubagentRegistryRestorer(config: {
       }
     };
     const cfg = getRuntimeConfig();
-    const requesterTurns = new Map<string, Map<string, SubagentRunRecord[]>>();
-    const resolveRequesterAgentId = (entry: SubagentRunRecord) =>
-      resolveSubagentRequesterAgentId(cfg, entry);
+    const requesterTurns = new Map<string, Map<string, SubagentRunRecord>>();
     for (const entry of runs.values()) {
       const requesterTurnRunId = entry.requesterTurnRunId?.trim();
       if (!requesterTurnRunId || entry.expectsCompletionMessage !== true) {
         continue;
       }
-      const requesterIdentity = `${resolveRequesterAgentId(entry) ?? "unknown"}\0${entry.requesterSessionKey}`;
+      const requesterIdentity = `${resolveSubagentRequesterAgentId(cfg, entry) ?? "unknown"}\0${entry.requesterSessionKey}`;
       let turns = requesterTurns.get(requesterIdentity);
       if (!turns) {
         turns = new Map();
         requesterTurns.set(requesterIdentity, turns);
       }
-      const entries = turns.get(requesterTurnRunId) ?? [];
-      entries.push(entry);
-      turns.set(requesterTurnRunId, entries);
+      turns.set(requesterTurnRunId, turns.get(requesterTurnRunId) ?? entry);
     }
     for (const [, turns] of requesterTurns) {
-      for (const [requesterTurnRunId, entries] of turns) {
-        const firstEntry = entries[0];
-        if (!firstEntry) {
+      for (const [requesterTurnRunId, firstEntry] of turns) {
+        assertCurrent();
+        const requesterAgentId = resolveSubagentRequesterAgentId(cfg, firstEntry);
+        const entries = selectRequesterTurnChildren(
+          runs,
+          firstEntry.requesterSessionKey,
+          requesterAgentId,
+          requesterTurnRunId,
+          (entry) =>
+            warn("skipped superseded requester transfer during restart recovery", {
+              runId: entry.runId,
+            }),
+        );
+        if (entries.length === 0) {
           continue;
         }
-        assertCurrent();
         await settleRequesterTurn(
           {
             requesterSessionKey: firstEntry.requesterSessionKey,
             stateContext,
             assertCurrent,
-            requesterAgentId: resolveRequesterAgentId(firstEntry),
+            requesterAgentId,
             requesterTurnRunId,
             requesterYielded: entries.every((entry) => entry.requesterTurnYielded === true),
             acceptedSessionSpawns: entries.map((entry) => ({
