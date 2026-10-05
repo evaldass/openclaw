@@ -3,6 +3,7 @@ import { retryAsync } from "openclaw/plugin-sdk/retry-runtime";
 import { sleepWithAbort } from "openclaw/plugin-sdk/runtime-env";
 import { safeEqualSecret } from "openclaw/plugin-sdk/security-runtime";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { raceWithTimeout } from "openclaw/plugin-sdk/time-runtime";
 import type { WebhookSecurityConfig } from "../config.js";
 import { getHeader } from "../http-headers.js";
 import { generateDtmfRedirectTwiml } from "../manager/twiml.js";
@@ -625,37 +626,25 @@ export class TwilioProvider implements VoiceCallProvider {
       }, CHUNK_DELAY_MS);
 
       let muLawAudio: Buffer;
-      let synthTimeout: ReturnType<typeof setTimeout> | null = null;
-      let removeAbortListener = () => {};
       const synthTimeoutMs = ttsProvider.synthesisTimeoutMs;
       try {
-        const synthPromise = ttsProvider.synthesizeForTelephony(text);
-        const timeoutPromise = new Promise<Buffer>((_, reject) => {
-          synthTimeout = setTimeout(() => {
-            reject(new Error(`Telephony TTS synthesis timed out after ${synthTimeoutMs}ms`));
-          }, synthTimeoutMs);
-        });
-        const abortPromise = new Promise<never>((_, reject) => {
-          const onAbort = () => {
-            reject(
-              signal.reason instanceof Error
+        muLawAudio = await raceWithTimeout(
+          ttsProvider.synthesizeForTelephony(text),
+          synthTimeoutMs,
+          () => {
+            throw new Error(`Telephony TTS synthesis timed out after ${synthTimeoutMs}ms`);
+          },
+          {
+            signal,
+            onAbort: () => {
+              throw signal.reason instanceof Error
                 ? signal.reason
-                : new Error("Telephony TTS synthesis aborted"),
-            );
-          };
-          signal.addEventListener("abort", onAbort, { once: true });
-          removeAbortListener = () => signal.removeEventListener("abort", onAbort);
-          if (signal.aborted) {
-            onAbort();
-          }
-        });
-        muLawAudio = await Promise.race([synthPromise, timeoutPromise, abortPromise]);
+                : new Error("Telephony TTS synthesis aborted");
+            },
+          },
+        );
       } finally {
-        if (synthTimeout) {
-          clearTimeout(synthTimeout);
-        }
         clearInterval(keepAlive);
-        removeAbortListener();
       }
 
       if (muLawAudio.length === 0) {
