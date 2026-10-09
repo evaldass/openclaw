@@ -508,7 +508,7 @@ describe("voice-call call record store", () => {
     },
   );
 
-  it("propagates pruning rejection and preserves restore versus status read errors", async () => {
+  it("propagates pruning, startup restore, and status read errors", async () => {
     const storePath = createTestStorePath();
     const call = CallRecordSchema.parse(makePersistedCall({ callId: "call-read-error" }));
     const failure = new Error("delayed SQLite read rejected");
@@ -522,7 +522,7 @@ describe("voice-call call record store", () => {
     });
     await expect(persistCallRecord(storePath, call)).rejects.toBe(failure);
     await expect(getCallHistoryFromStore(storePath)).resolves.toEqual([]);
-    expect((await loadActiveCallsFromStore(storePath)).activeCalls.size).toBe(0);
+    await expect(loadActiveCallsFromStore(storePath)).rejects.toBe(failure);
     await expect(findCallInStore(storePath, call.callId)).rejects.toBe(failure);
     installStateRuntime();
     resetPluginStateStoreForTests();

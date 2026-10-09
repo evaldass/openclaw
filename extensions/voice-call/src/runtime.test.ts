@@ -281,43 +281,50 @@ describe("createVoiceCallRuntime lifecycle", () => {
     await runtime.stop();
   });
 
-  it("cleans up tunnel, tailscale, and webhook server when init fails after start", async () => {
-    const config = createBaseConfig();
-    config.tunnel.provider = "tailscale-funnel";
-    config.tailscale.port = 8443;
-    const tunnelStop = vi.fn().mockResolvedValue(undefined);
-    mocks.startTunnel.mockResolvedValue({
-      publicUrl: "https://public.example:8443/voice/webhook",
-      provider: "tailscale-funnel",
-      stop: tunnelStop,
-    });
-    mocks.managerInitialize.mockRejectedValue(new Error("init failed"));
-
-    await expect(
-      createVoiceCallRuntime({
-        scheduler: createTestPluginServiceScheduler(),
-        config,
-        coreConfig: {},
-        agentRuntime: {} as never,
-      }),
-    ).rejects.toThrow("init failed");
-
-    expect(mocks.startTunnel).toHaveBeenCalledWith(
-      expect.objectContaining({
+  it.each(["init failed", "PLUGIN_TRUST_REFUSED"])(
+    "cleans up startup without readiness on %s",
+    async (code) => {
+      const config = createBaseConfig();
+      config.tunnel.provider = "tailscale-funnel";
+      config.tailscale.port = 8443;
+      const tunnelStop = vi.fn().mockResolvedValue(undefined);
+      mocks.startTunnel.mockResolvedValue({
+        publicUrl: "https://public.example:8443/voice/webhook",
         provider: "tailscale-funnel",
-        tailscalePort: 8443,
-        streamPaths: [
-          {
-            localPath: "/voice/stream/realtime",
-            publicPath: "/voice/stream/realtime",
-          },
-        ],
-      }),
-    );
-    expect(tunnelStop).toHaveBeenCalledTimes(1);
-    expect(mocks.cleanupTailscaleExposure).toHaveBeenCalledTimes(1);
-    expect(mocks.webhookStop).toHaveBeenCalledTimes(1);
-  });
+        stop: tunnelStop,
+      });
+      const failure = Object.assign(new Error(code), { code });
+      const info = vi.fn();
+      mocks.managerInitialize.mockRejectedValue(failure);
+
+      await expect(
+        createVoiceCallRuntime({
+          scheduler: createTestPluginServiceScheduler(),
+          config,
+          coreConfig: {},
+          agentRuntime: {} as never,
+          logger: { info, warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+        }),
+      ).rejects.toBe(failure);
+      expect(info).not.toHaveBeenCalledWith("[voice-call] Runtime initialized");
+
+      expect(mocks.startTunnel).toHaveBeenCalledWith(
+        expect.objectContaining({
+          provider: "tailscale-funnel",
+          tailscalePort: 8443,
+          streamPaths: [
+            {
+              localPath: "/voice/stream/realtime",
+              publicPath: "/voice/stream/realtime",
+            },
+          ],
+        }),
+      );
+      expect(tunnelStop).toHaveBeenCalledTimes(1);
+      expect(mocks.cleanupTailscaleExposure).toHaveBeenCalledTimes(1);
+      expect(mocks.webhookStop).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("returns an idempotent stop handler", async () => {
     const tunnelStop = vi.fn().mockResolvedValue(undefined);
