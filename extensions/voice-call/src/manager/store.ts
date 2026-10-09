@@ -73,7 +73,7 @@ function createCallRecordStateStores(
   };
 }
 
-/** Open call stores and log failures instead of breaking restore paths. */
+/** Best-effort history listing only; startup restore must propagate failures. */
 function tryCreateCallRecordStateStores(
   storePath: string,
   stateRuntime?: VoiceCallStateRuntime["state"],
@@ -326,13 +326,11 @@ export async function loadActiveCallsFromStore(
   activeCalls: Map<CallId, CallRecord>;
   processedEventIds: Set<string>;
 }> {
-  const stores = tryCreateCallRecordStateStores(storePath, stateRuntime);
-  let calls: CallRecord[] = [];
-  try {
-    calls = stores ? await readCallRecordEvents(stores) : [];
-  } catch (err) {
-    console.error("[voice-call] Failed to read SQLite call records:", err);
-  }
+  // An unavailable store is not an empty history. In particular, an untrusted
+  // install must not announce readiness after the host refuses durable state.
+  // Propagate both admission and read failures to service startup/health.
+  const stores = createCallRecordStateStores(storePath, stateRuntime);
+  const calls = await readCallRecordEvents(stores);
   const callMap = new Map<CallId, CallRecord>();
   for (const call of calls) {
     // Reinsert so iteration follows the latest retained snapshot for each call.

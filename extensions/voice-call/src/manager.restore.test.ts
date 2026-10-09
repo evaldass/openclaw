@@ -154,6 +154,33 @@ describe("CallManager verification on restore", () => {
     );
   });
 
+  it("fails initialization when the host refuses durable state instead of restoring an empty history", async () => {
+    const state = installStateRuntime();
+    const refusal = Object.assign(
+      new Error("openKeyedStore is only available for trusted plugins"),
+      {
+        code: "PLUGIN_TRUST_REFUSED",
+      },
+    );
+    const manager = registerTestManagerCleanup(
+      new CallManager(
+        VoiceCallConfigSchema.parse({ enabled: true, provider: "mock" }),
+        createTestStorePath(),
+        undefined,
+        {
+          ...state,
+          openKeyedStore: () => {
+            throw refusal;
+          },
+        },
+      ),
+    );
+    await expect(manager.initialize(new FakeProvider(), "http://127.0.0.1/webhook")).rejects.toBe(
+      refusal,
+    );
+    expect(manager.getActiveCalls()).toEqual([]);
+  });
+
   it("resolves a terminal call from persisted state after restore", async () => {
     const { call, manager } = await initializeManager({
       callOverrides: { state: "completed", endReason: "completed", endedAt: Date.now() },
