@@ -772,7 +772,7 @@ export class VoiceCallWebhookServer {
           return this.realtimeHandler!.buildTwiMLPayload(req, realtimeParams);
         }
 
-        const parsed = this.provider.parseWebhookEvent(ctx, {
+        const parsed = await this.provider.parseWebhookEvent(ctx, {
           verifiedRequestKey: verification.verifiedRequestKey,
         });
         if (!isReplay && (await this.processParsedEvents(parsed.events))) {

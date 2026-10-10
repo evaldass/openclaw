@@ -90,7 +90,7 @@ vi.mock("@livekit/rtc-node", async () => {
 function harness() {
   let transport: RealtimeMediaTransport | undefined;
   const sendAudio = vi.fn();
-  const endCall = vi.fn();
+  const endCall = vi.fn(async () => {});
   let played!: () => void;
   const playedPromise = new Promise<void>((resolve) => {
     played = resolve;

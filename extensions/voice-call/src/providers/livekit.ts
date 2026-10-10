@@ -7,6 +7,7 @@ import {
   WebhookReceiver,
   type WebhookEvent,
 } from "livekit-server-sdk";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { normalizeResolvedSecretInputString } from "openclaw/plugin-sdk/secret-input";
 import type { LiveKitConfig } from "../config.js";
 import type { CallManager } from "../manager.js";
@@ -25,7 +26,11 @@ import type {
 } from "../types.js";
 import type { RealtimeCallHandler } from "../webhook/realtime-handler.js";
 import type { VoiceCallProvider } from "./base.js";
-import { connectLiveKitAudio, type LiveKitAudioConnection } from "./livekit-audio.js";
+import {
+  connectLiveKitAudio,
+  LiveKitAudioCleanupError,
+  type LiveKitAudioConnection,
+} from "./livekit-audio.js";
 
 type CallRoom = {
   room: string;
@@ -52,6 +57,8 @@ export class LiveKitProvider implements VoiceCallProvider {
   readonly name = "livekit" as const;
   private readonly calls = new Map<string, CallRoom>();
   private readonly retiredRooms = new Map<string, number>();
+  private readonly disposals = new Map<string, Promise<void>>();
+  private readonly terminalRooms = new Map<string, CallRoom>();
   private readonly operations = new Set<Promise<unknown>>();
   private readonly answers = new Map<string, Promise<void>>();
   private readonly verified = new WeakMap<WebhookContext, WebhookEvent>();
@@ -98,8 +105,25 @@ export class LiveKitProvider implements VoiceCallProvider {
   private retire(room: string): void {
     this.retiredRooms.delete(room);
     this.retiredRooms.set(room, Date.now() + 300000);
-    while (this.retiredRooms.size > 4096)
-      this.retiredRooms.delete(this.retiredRooms.keys().next().value!);
+    while (this.retiredRooms.size > 4096) {
+      const oldest = this.retiredRooms.keys().next().value!;
+      this.retiredRooms.delete(oldest);
+      this.releaseTerminalRoom(oldest);
+    }
+  }
+
+  private releaseTerminalRoom(room: string): void {
+    const call = this.terminalRooms.get(room);
+    // Tombstone retention bounds admission history, not unresolved manager
+    // finalization. Correlation remains live until the authoritative call retires.
+    if (
+      this.calls.has(room) ||
+      (call && this.manager?.getCall(call.callId)?.providerCallId === room)
+    ) {
+      return;
+    }
+    this.disposals.delete(room);
+    this.terminalRooms.delete(room);
   }
 
   private rejectRoom(room: string): void {
@@ -215,17 +239,34 @@ export class LiveKitProvider implements VoiceCallProvider {
     }
   }
 
-  parseWebhookEvent(ctx: WebhookContext): ProviderWebhookParseResult {
+  async parseWebhookEvent(ctx: WebhookContext): Promise<ProviderWebhookParseResult> {
     const event = this.verified.get(ctx);
     this.verified.delete(ctx);
     if (!event) return { events: [] };
     const room = event.room?.name;
     if (!room?.startsWith(this.config.roomPrefix)) return { events: [] };
     const now = Date.now();
-    for (const [name, expiry] of this.retiredRooms)
-      if (expiry <= now) this.retiredRooms.delete(name);
-    if (this.retiredRooms.has(room)) return { events: [] };
-    let call = this.calls.get(room);
+    for (const [name, expiry] of this.retiredRooms) {
+      if (expiry <= now) {
+        this.retiredRooms.delete(name);
+        this.releaseTerminalRoom(name);
+      }
+    }
+    for (const name of this.terminalRooms.keys()) {
+      if (!this.retiredRooms.has(name)) {
+        this.releaseTerminalRoom(name);
+      }
+    }
+    const terminal =
+      event.event === "participant_left" ||
+      event.event === "participant_connection_aborted" ||
+      event.event === "room_finished";
+    let call = this.calls.get(room) ?? (terminal ? this.terminalRooms.get(room) : undefined);
+    // Retirement prevents fresh admission, not recovery of authenticated terminal
+    // delivery after carrier cleanup or manager terminal persistence failed.
+    if (this.retiredRooms.has(room) && !(terminal && call)) {
+      return { events: [] };
+    }
     if (!call && event.event === "room_finished") {
       this.retire(room);
       return { events: [] };
@@ -257,7 +298,9 @@ export class LiveKitProvider implements VoiceCallProvider {
       };
       this.calls.set(room, call);
     }
-    if (!call || call.closed) return { events: [] };
+    if (!call || (call.closed && !terminal)) {
+      return { events: [] };
+    }
     if (
       event.event !== "room_finished" &&
       (!participant ||
@@ -278,20 +321,10 @@ export class LiveKitProvider implements VoiceCallProvider {
     const events: NormalizedEvent[] = [];
     if (event.event === "participant_joined" && call.direction === "inbound")
       events.push({ ...base, type: "call.initiated" });
-    if (
-      event.event === "participant_left" ||
-      event.event === "participant_connection_aborted" ||
-      event.event === "room_finished"
-    ) {
-      const cleanup = this.dispose(call);
-      this.operations.add(cleanup);
-      void cleanup.then(
-        () => this.operations.delete(cleanup),
-        () => {
-          this.operations.delete(cleanup);
-          console.warn("[voice-call] LiveKit call cleanup failed");
-        },
-      );
+    if (terminal) {
+      // An authenticated terminal event cannot retire the manager's transcript
+      // owner until the same carrier/provider durability barrier as hangup joins.
+      await this.dispose(call);
       events.push({ ...base, type: "call.ended", reason: "completed" });
     }
     return { events, providerResponseBody: "", statusCode: 200 };
@@ -350,6 +383,12 @@ export class LiveKitProvider implements VoiceCallProvider {
       await this.join(call);
       return { providerCallId: room, status: "initiated" };
     } catch {
+      // Cancellation can delete the room while createRoom/createSipParticipant
+      // is still in flight; their late success may recreate carrier resources.
+      if (call.closed && !call.joining && !this.disconnectFailures.has(room)) {
+        this.disposals.delete(room);
+        this.terminalRooms.delete(room);
+      }
       try {
         await this.dispose(call);
       } catch {
@@ -409,48 +448,91 @@ export class LiveKitProvider implements VoiceCallProvider {
       const token = await this.roomToken(call.room);
       if (call.closed || this.stopping || this.manager.getCall(call.callId) !== record)
         throw new Error("Call inactive");
-      const connection = await this.deps.connectAudio({
-        url: this.config.url,
-        token,
-        room: call.room,
-        identity: call.identity,
-        participantSid: call.participantSid,
-        callId: call.callId,
-        handler: this.handler,
-        isCurrent: () =>
-          !call.closed && !this.stopping && this.manager?.getCall(call.callId) === record,
-        onDisconnect: (reason) => {
-          void this.manager?.endCall(call.callId, { reason });
-        },
-      });
+      const connection = await this.deps
+        .connectAudio({
+          url: this.config.url,
+          token,
+          room: call.room,
+          identity: call.identity,
+          participantSid: call.participantSid,
+          callId: call.callId,
+          handler: this.handler,
+          isCurrent: () =>
+            !call.closed && !this.stopping && this.manager?.getCall(call.callId) === record,
+          onDisconnect: (reason) => {
+            void this.manager?.endCall(call.callId, { reason });
+          },
+        })
+        .catch((error: unknown) => {
+          if (error instanceof LiveKitAudioCleanupError) {
+            this.disconnectFailures.add(call.room);
+          }
+          throw error;
+        });
+      // Publish even a cancelled admission's connection to the disposal owner so
+      // its cleanup failure cannot disappear as an ordinary join rejection.
+      call.connection = connection;
       if (call.closed || this.stopping) {
         await connection.close();
         throw new Error("Call inactive");
       }
-      call.connection = connection;
     })();
     return call.joining;
   }
 
-  private async dispose(call: CallRoom): Promise<void> {
+  private dispose(call: CallRoom): Promise<void> {
+    const existing = this.disposals.get(call.room);
+    if (existing) {
+      return existing;
+    }
     call.closed = true;
     this.retire(call.room);
-    try {
-      await call.connection?.close();
-    } catch {
-      // Room deletion is still mandatory. A successful unrelated deletion must
-      // never erase an RTC disconnect failure (close promises are idempotent).
-      this.disconnectFailures.add(call.room);
-    }
-    await this.deleteRoom(call.room);
-    this.calls.delete(call.room);
-    if (this.disconnectFailures.has(call.room)) throw new Error("LiveKit RTC disconnect failed");
+    const completion = createDeferred<void>();
+    this.disposals.set(call.room, completion.promise);
+    this.operations.add(completion.promise);
+    const work = (async () => {
+      // Admission may still own a connection not yet published on the call.
+      // It sees closed, drains that connection and then settles its join.
+      await call.joining?.catch(() => {});
+      try {
+        await call.connection?.close();
+      } catch {
+        // Never let successful room deletion erase a provider/transcript failure.
+        this.disconnectFailures.add(call.room);
+      }
+      await this.deleteRoom(call.room);
+      if (this.disconnectFailures.has(call.room)) {
+        throw new Error("LiveKit RTC disconnect failed");
+      }
+      this.calls.delete(call.room);
+      this.terminalRooms.set(call.room, call);
+    })();
+    void work.then(
+      () => {
+        this.operations.delete(completion.promise);
+        completion.resolve();
+      },
+      (error: unknown) => {
+        this.operations.delete(completion.promise);
+        // A transient carrier deletion can retry; a failed transcript/provider
+        // drain must remain failed for concurrent and subsequent hangup callers.
+        if (!this.disconnectFailures.has(call.room)) {
+          this.disposals.delete(call.room);
+        }
+        completion.reject(error);
+      },
+    );
+    return completion.promise;
   }
 
   async hangupCall(input: HangupCallInput): Promise<void> {
     const call = this.calls.get(input.providerCallId);
     if (call) await this.dispose(call);
     else if (input.providerCallId.startsWith(this.config.roomPrefix)) {
+      const disposed = this.disposals.get(input.providerCallId);
+      if (disposed) {
+        return disposed;
+      }
       this.retire(input.providerCallId);
       await this.deleteRoom(input.providerCallId);
     } else throw new Error("LiveKit call room is outside the configured room prefix");

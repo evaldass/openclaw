@@ -47,7 +47,7 @@ it("confirms native 160ms prefix while sustained captures continue, not at utter
         transport = params.transport;
         return {
           sendAudio: () => {},
-          endCall: () => {},
+          endCall: async () => {},
           acknowledgeMark: () => {
             capturesAtAck = captures;
             acknowledged(performance.now() - start);

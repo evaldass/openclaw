@@ -184,7 +184,7 @@ async function harness(
   const receive = async (event: WebhookEvent) => {
     const ctx = context(event);
     expect((await provider.verifyWebhook(ctx)).ok).toBe(true);
-    const result = provider.parseWebhookEvent(ctx);
+    const result = await provider.parseWebhookEvent(ctx);
     for (const normalized of result.events) await manager.processEvent(normalized);
     const call = manager.getCallByProviderCallId(event.room!.name);
     if (call && result.events.some((item) => item.type === "call.initiated"))
@@ -404,7 +404,7 @@ describe("LiveKit telephony lifecycle", () => {
         "sip.trunkPhoneNumber": to,
       },
     });
-    expect(h.provider.parseWebhookEvent(context(event)).events).toEqual([]);
+    expect((await h.provider.parseWebhookEvent(context(event))).events).toEqual([]);
     await h.receive(event);
     await h.receive(
       webhook("openclaw-call-human", "participant_joined", "human", { kind: "STANDARD" }),
@@ -565,7 +565,7 @@ it("fails closed on startup webhooks before binding rather than stranding the ca
   });
   const ctx = context(webhook("openclaw-call-before-bind"));
   await provider.verifyWebhook(ctx);
-  expect(provider.parseWebhookEvent(ctx).events).toEqual([]);
+  expect((await provider.parseWebhookEvent(ctx)).events).toEqual([]);
   await provider.stop();
   expect(h.rooms.deleteRoom).toHaveBeenCalledWith("openclaw-call-before-bind");
   expect(h.connectAudio).not.toHaveBeenCalled();
@@ -615,7 +615,7 @@ it("uses current time for signed events lacking createdAt", async () => {
   event.createdAt = 0n;
   const ctx = context(event);
   await h.provider.verifyWebhook(ctx);
-  expect(h.provider.parseWebhookEvent(ctx).events[0]!.timestamp).toBeGreaterThan(0);
+  expect((await h.provider.parseWebhookEvent(ctx)).events[0]!.timestamp).toBeGreaterThan(0);
   await h.provider.stop();
   await h.handler.close();
 });
@@ -711,7 +711,9 @@ it.each([false, true])(
     await h.receive(webhook(room));
     h.close.mockRejectedValue(new Error("secret disconnect failure"));
     if (deleteFails) h.rooms.deleteRoom.mockRejectedValueOnce(new Error("secret delete failure"));
-    await h.receive(webhook(room, "participant_left", "left"));
+    await expect(h.receive(webhook(room, "participant_left", "left"))).rejects.toThrow(
+      deleteFails ? "LiveKit room cleanup failed" : "LiveKit RTC disconnect failed",
+    );
     await h.provider.retryPendingCleanup();
     expect(h.rooms.deleteRoom).toHaveBeenCalledWith(room);
     if (deleteFails)
@@ -747,4 +749,36 @@ it("removes restored cleanup bookkeeping when the manager record disappeared", a
   expect((replacement as unknown as { restoredCleanup: Set<string> }).restoredCleanup.size).toBe(0);
   await replacement.stop();
   await h.handler.close();
+});
+
+it("retains a failed drain from a connection returned after admission cancellation", async () => {
+  const h = await harness();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const close = vi.fn(async () => {
+    throw new Error("Synthetic unpublished final persistence failure");
+  });
+  h.connectAudio.mockImplementation(async () => {
+    entered.resolve();
+    await release.promise;
+    return { close };
+  });
+  const placement = h.manager.initiateCall(to, undefined, { mode: "conversation" });
+  let hangup: ReturnType<CallManager["endCall"]> | undefined;
+  try {
+    await entered.promise;
+    const call = h.manager.getActiveCalls()[0]!;
+    hangup = h.manager.endCall(call.callId, { reason: "completed" });
+    release.resolve();
+    expect(await hangup).toMatchObject({ success: false, error: "LiveKit RTC disconnect failed" });
+    expect((await placement).success).toBe(false);
+    expect(close).toHaveBeenCalled();
+    expect(h.rooms.deleteRoom).toHaveBeenCalledOnce();
+    await expect(h.provider.stop()).rejects.toThrow("cleanup failed during shutdown");
+  } finally {
+    release.resolve();
+    await placement;
+    await hangup;
+    await h.handler.close();
+  }
 });
