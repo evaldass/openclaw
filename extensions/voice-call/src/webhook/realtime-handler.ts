@@ -223,9 +223,16 @@ export type RealtimeMediaTransport = {
   send: (message: string) => void;
   close: (code?: number, reason?: string) => void;
 };
+export class RealtimeCallCleanupError extends Error {
+  constructor() {
+    super("Realtime provider/transcript cleanup failed");
+  }
+}
+
 export type RealtimeRoomBinding = {
   sendAudio: (audio: Buffer) => void;
-  endCall: () => void;
+  /** Carrier-owned disposal, without joining a manager termination that may call back here. */
+  endCall: () => Promise<void>;
   acknowledgeMark: (name: string) => void;
 };
 
@@ -291,7 +298,7 @@ type RealtimeTelephonyBinding = {
   bridge: ActiveRealtimeVoiceBridge;
   acknowledgeCarrierMark: (markName?: string) => void;
   close: (cause: RealtimeCallEndCause) => Promise<void>;
-  endCall: () => void;
+  endCall: () => Promise<void>;
   noteMediaActivity: () => void;
   retire: () => void;
 };
@@ -710,6 +717,7 @@ export class RealtimeCallHandler {
       params.transport,
       { callId: params.callId },
       new StreamFrameAdapter("twilio"),
+      true,
     );
     this.trackShutdownWork(
       admission.then(() => {}),
@@ -718,7 +726,10 @@ export class RealtimeCallHandler {
     const admitted = await admission;
     if (!admitted) return null;
     if (this.closing) {
-      await admitted.close("shutdown");
+      // RTC admission still belongs to the carrier join. Terminating the manager
+      // here would await hangupCall, which must itself join this admission.
+      void admitted.close("shutdown").catch(() => {});
+      await admitted.endCall();
       return null;
     }
     this.roomBindings.add(admitted);
@@ -729,7 +740,7 @@ export class RealtimeCallHandler {
       },
       endCall: () => {
         this.roomBindings.delete(admitted);
-        admitted.endCall();
+        return admitted.endCall();
       },
       acknowledgeMark: (name) => admitted.acknowledgeCarrierMark(name),
     };
@@ -741,6 +752,7 @@ export class RealtimeCallHandler {
     ws: RealtimeMediaTransport,
     callerMeta: Omit<PendingStreamToken, "expiry">,
     adapter: Pick<StreamFrameAdapter, "serializeMedia" | "serializeClear" | "serializeMark">,
+    carrierOwnsAdmission = false,
   ): Promise<RealtimeTelephonyBinding | null> {
     const preparedCall = await this.prepareCallInManager(callSid, callerMeta);
     if (!preparedCall) {
@@ -777,7 +789,10 @@ export class RealtimeCallHandler {
     const abandonAdmission = async (): Promise<void> => {
       if (!this.activeBridgesByCallId.has(callId)) {
         if (this.closing || this.serverClosingSockets.has(ws)) {
-          await emitCallEnd("shutdown");
+          const completion = emitCallEnd("shutdown");
+          if (!carrierOwnsAdmission) {
+            await completion;
+          }
         } else {
           this.streamDisconnectLifecycle.connect(callSid, streamSid);
           this.streamDisconnectLifecycle.disconnect(callSid, streamSid);
@@ -1350,9 +1365,11 @@ export class RealtimeCallHandler {
     }
     if (!candidate || provisionalCloseReason) {
       this.rollbackUserTranscriptOwnerAdoption(callId, userTranscriptAdoption);
+      let cleanupFailed = false;
       try {
         await drainProviderClose(() => candidate?.close());
       } catch (error) {
+        cleanupFailed = true;
         console.warn(
           `[voice-call] Failed to close realtime bridge ${callSid}: ${formatErrorMessage(error)}`,
         );
@@ -1366,6 +1383,9 @@ export class RealtimeCallHandler {
       }
       if (ws.readyState === WebSocket.OPEN) {
         ws.close(reason === "error" ? 1011 : 1000, "Failed to create realtime bridge");
+      }
+      if (cleanupFailed && carrierOwnsAdmission) {
+        throw new RealtimeCallCleanupError();
       }
       return null;
     }
@@ -1415,11 +1435,14 @@ export class RealtimeCallHandler {
       sessionClosed = true;
       this.cancelConsultSession(callId, session);
       audioPacer.close();
-      sessionClosePromise = drainProviderClose(closeSession).finally(() => {
+      const completion = createDeferred<void>();
+      sessionClosePromise = completion.promise;
+      const work = drainProviderClose(closeSession).finally(() => {
         this.clearActiveBridgeMappings(callId, callSid, session);
         this.clearUserTranscriptState(callId, userTranscriptOwner);
         harness.close();
       });
+      void work.then(completion.resolve, completion.reject);
       return sessionClosePromise;
     };
 
@@ -1432,12 +1455,13 @@ export class RealtimeCallHandler {
     };
     let bindingClosed = false;
     let bindingClosePromise: Promise<void> | undefined;
+    let bindingCompletionPromise: Promise<void> | undefined;
     const closeBinding = (
       binding: RealtimeTelephonyBinding,
       cause?: RealtimeCallEndCause,
     ): Promise<void> => {
       if (bindingClosed) {
-        return bindingClosePromise ?? callEndPromise ?? Promise.resolve();
+        return (cause ? bindingCompletionPromise : bindingClosePromise) ?? Promise.resolve();
       }
       bindingClosed = true;
       clearLivenessTimer();
@@ -1450,27 +1474,30 @@ export class RealtimeCallHandler {
         } else {
           this.streamDisconnectLifecycle.retire(callSid, streamSid);
         }
-        if (ownsCall && stillOwnsCall && cause && cause !== "disconnect") {
-          return emitCallEnd(cause);
-        }
-        return Promise.resolve();
+        return ownsCall && stillOwnsCall;
       };
-      let pending: Promise<void>;
-      try {
-        pending = Promise.resolve(session.close());
-      } catch (error) {
-        pending = Promise.reject(
-          error instanceof Error
-            ? error
-            : new Error("Realtime provider close failed", { cause: error }),
-        );
-      }
-      bindingClosePromise = pending.then(finishClose, async (error: unknown) => {
+      const providerDisposal = createDeferred<void>();
+      const pending = providerDisposal.promise;
+      // The disposal promise excludes manager termination: hangupCall can reenter
+      // endCall while the outer close is waiting for manager.endCall.
+      let shouldEndCall = false;
+      bindingClosePromise = pending.then(
+        () => {
+          shouldEndCall = finishClose();
+        },
+        (error: unknown) => {
+          shouldEndCall = finishClose();
+          throw error;
+        },
+      );
+      const terminate = () =>
+        shouldEndCall && cause && cause !== "disconnect" ? emitCallEnd(cause) : Promise.resolve();
+      const completion = bindingClosePromise.then(terminate, async (error: unknown) => {
         console.warn(
           `[voice-call] Failed to close realtime bridge ${callSid}: ${formatErrorMessage(error)}`,
         );
         try {
-          await finishClose();
+          await terminate();
         } catch (terminationError) {
           throw new AggregateError([error, terminationError], "Realtime call cleanup failed", {
             cause: terminationError,
@@ -1478,8 +1505,19 @@ export class RealtimeCallHandler {
         }
         throw error;
       });
-      this.trackShutdownWork(bindingClosePromise, this.terminationAttempts);
-      return bindingClosePromise;
+      bindingCompletionPromise = completion;
+      this.trackShutdownWork(completion, this.terminationAttempts);
+      // Publish both promises before provider.close can synchronously close the
+      // carrier and reenter this binding through manager.hangupCall.
+      try {
+        void Promise.resolve(session.close()).then(
+          providerDisposal.resolve,
+          providerDisposal.reject,
+        );
+      } catch (error) {
+        providerDisposal.reject(error);
+      }
+      return cause ? completion : bindingClosePromise;
     };
     const telephonyBinding: RealtimeTelephonyBinding = {
       bridge: session,
@@ -1500,10 +1538,11 @@ export class RealtimeCallHandler {
       endCall: () => {
         // Close the provider session before the carrier socket so no pending
         // response can reach the caller after the hang-up request succeeds.
-        void closeBinding(telephonyBinding);
+        const disposal = closeBinding(telephonyBinding);
         if (ws.readyState === WebSocket.OPEN) {
           ws.close(1000, "Call ended");
         }
+        return disposal;
       },
       noteMediaActivity: () => {
         if (
@@ -2041,7 +2080,7 @@ export class RealtimeCallHandler {
       payload: { name: REALTIME_VOICE_END_CALL_TOOL_NAME, result: { success: true } },
       final: true,
     });
-    binding.endCall();
+    await binding.endCall();
   }
 
   private async executeToolCall(

@@ -38,7 +38,10 @@ export interface VoiceCallProvider {
    * Parse provider-specific webhook payload into normalized events.
    * Returns events and optional response to send back to provider.
    */
-  parseWebhookEvent(ctx: WebhookContext, options?: WebhookParseOptions): ProviderWebhookParseResult;
+  parseWebhookEvent(
+    ctx: WebhookContext,
+    options?: WebhookParseOptions,
+  ): ProviderWebhookParseResult | Promise<ProviderWebhookParseResult>;
 
   /**
    * Consume one-time TwiML that must be served before shortcut handlers such as

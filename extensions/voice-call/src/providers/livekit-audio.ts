@@ -1,11 +1,19 @@
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { convertPcmToMulaw8k, mulawToPcm } from "openclaw/plugin-sdk/realtime-voice";
-import type {
-  RealtimeCallHandler,
-  RealtimeMediaTransport,
-  RealtimeRoomBinding,
+import {
+  RealtimeCallCleanupError,
+  type RealtimeCallHandler,
+  type RealtimeMediaTransport,
+  type RealtimeRoomBinding,
 } from "../webhook/realtime-handler.js";
 
 export type LiveKitAudioConnection = { close: () => Promise<void> };
+/** A failed admission still owes a provider/transcript drain, not just room deletion. */
+export class LiveKitAudioCleanupError extends Error {
+  constructor() {
+    super("LiveKit RTC audio cleanup failed");
+  }
+}
 export type LiveKitAudioParams = {
   url: string;
   token: string;
@@ -47,17 +55,37 @@ export async function connectLiveKitAudio(
     closed = true;
     generation++;
     clearMarks();
-    binding?.endCall();
+    source.clearQueue();
     room.removeAllListeners();
-    closePromise = (async () => {
-      await Promise.allSettled([...readers].map((reader) => reader.cancel()));
-      await connectPromise?.catch(() => {});
-      await room.disconnect();
-      await output.catch(() => {});
-      await source.close();
-
-      await Promise.allSettled(tasks);
+    // Publish the owner before binding disposal can reenter transport.close.
+    // Carrier cleanup and the stock transcript drain are independent obligations.
+    const completion = createDeferred<void>();
+    closePromise = completion.promise;
+    const disposal = binding?.endCall();
+    const work = (async () => {
+      const results = await Promise.allSettled([
+        disposal,
+        (async () => {
+          await Promise.allSettled([...readers].map((reader) => reader.cancel()));
+          await connectPromise?.catch(() => {});
+          try {
+            await room.disconnect();
+          } finally {
+            await output.catch(() => {});
+            await source.close();
+            await Promise.allSettled(tasks);
+          }
+        })(),
+      ]);
+      const failures = results.filter((result) => result.status === "rejected");
+      if (failures.length) {
+        throw new AggregateError(
+          failures.map((result) => result.reason),
+          "LiveKit audio cleanup failed",
+        );
+      }
     })();
+    void work.then(completion.resolve, completion.reject);
     return closePromise;
   };
   const disconnected = (reason: "completed" | "error" = "completed") => {
@@ -211,11 +239,30 @@ export async function connectLiveKitAudio(
       streamId: `rtc:${params.room}`,
       transport,
     });
-    if (!binding || !current()) throw new Error("Realtime call admission failed");
+    if (!binding || !current()) {
+      // Native disconnect can finish before attachment returns its binding.
+      // That late binding still owns provider finals and must be joined here.
+      try {
+        await binding?.endCall();
+      } catch {
+        throw new LiveKitAudioCleanupError();
+      }
+      throw new Error("Realtime call admission failed");
+    }
     subscribe(participant);
     return { close };
-  } catch {
-    await close().catch(() => {});
+  } catch (error) {
+    try {
+      await close();
+    } catch {
+      throw new LiveKitAudioCleanupError();
+    }
+    if (error instanceof LiveKitAudioCleanupError) {
+      throw error;
+    }
+    if (error instanceof RealtimeCallCleanupError) {
+      throw new LiveKitAudioCleanupError();
+    }
     // Do not return vendor errors containing URL/token material.
     throw new Error("LiveKit RTC audio connection failed");
   }
