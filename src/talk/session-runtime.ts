@@ -41,7 +41,7 @@ export type RealtimeVoiceBridgeSession = Pick<
   readonly capabilities?: InternalRealtimeVoiceProviderCapabilities;
   sendUserMessage(text: string): void;
   handleBargeIn(options?: RealtimeVoiceBargeInOptions): void;
-  triggerGreeting(instructions?: string): void;
+  triggerGreeting: NonNullable<RealtimeVoiceBridge["triggerGreeting"]>;
 };
 
 /**
@@ -55,6 +55,8 @@ export type RealtimeVoiceBridgeSessionParams = Omit<
   capabilities?: InternalRealtimeVoiceProviderCapabilities;
   audioSink: RealtimeVoiceAudioSink;
   initialGreetingInstructions?: string;
+  /** Application-authored opening only, without session policy or backend context. */
+  initialGreetingDirective?: string;
   markStrategy?: RealtimeVoiceMarkStrategy;
   triggerGreetingOnReady?: boolean;
   /** Admit a host-requested response before the provider can complete it synchronously. */
@@ -84,6 +86,7 @@ export function createRealtimeVoiceBridgeSession(
   let terminalBeforeBridgeAdoption = false;
   let closeReported = false;
   let detached = false;
+  let initialGreetingTriggered = false;
   let closeCompletion: Promise<void> | undefined;
   const isAdmitting = () => phase === "admitting";
   const requireBridge = () => {
@@ -191,9 +194,13 @@ export function createRealtimeVoiceBridgeSession(
       }
       return bridge.submitToolResult(callId, result, options);
     },
-    triggerGreeting: (instructions) => {
+    triggerGreeting: (instructions, options) => {
       const bridge = requireBridge();
-      requestResponse(bridge.triggerGreeting?.bind(bridge, instructions));
+      requestResponse(
+        options
+          ? bridge.triggerGreeting?.bind(bridge, instructions, options)
+          : bridge.triggerGreeting?.bind(bridge, instructions),
+      );
     },
   };
   // Session inactivity is the shared admission boundary for both audio directions.
@@ -341,8 +348,18 @@ export function createRealtimeVoiceBridgeSession(
       if (!bridgeRef.current || !isAdmitting()) {
         return;
       }
-      if (params.triggerGreetingOnReady) {
-        session.triggerGreeting(params.initialGreetingInstructions);
+      if (params.triggerGreetingOnReady && !initialGreetingTriggered) {
+        initialGreetingTriggered = true;
+        try {
+          session.triggerGreeting(
+            params.initialGreetingInstructions,
+            params.initialGreetingDirective === undefined
+              ? undefined
+              : { greetingDirective: params.initialGreetingDirective },
+          );
+        } catch (error) {
+          reportCallbackError(error);
+        }
       }
       if (isAdmitting()) {
         params.onReady?.(session);

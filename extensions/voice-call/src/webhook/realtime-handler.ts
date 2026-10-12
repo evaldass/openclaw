@@ -868,6 +868,11 @@ export class RealtimeCallHandler {
       );
     }
     const initialGreetingInstructions = buildGreetingInstructions(instructions, initialGreeting);
+    // Response-driven providers retain their existing full response override. Live providers
+    // receive only the application opening; the complete policy already belongs to startup.
+    const initialGreetingDirective = initialGreeting?.trim()
+      ? `Greet the caller now. Say this greeting naturally, then pause and listen: "${initialGreeting.trim()}"`
+      : undefined;
     const harness = createRealtimeVoiceSessionHarness({
       talk: {
         sessionId: `voice-call:${callId}:realtime`,
@@ -1081,6 +1086,7 @@ export class RealtimeCallHandler {
           }
         : {}),
       initialGreetingInstructions,
+      initialGreetingDirective,
       triggerGreetingOnReady: Boolean(initialGreetingInstructions),
       audioSink: {
         isOpen: () => !sessionClosed && ws.readyState === WebSocket.OPEN,

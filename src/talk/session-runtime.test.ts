@@ -349,6 +349,60 @@ describe("realtime voice bridge session runtime", () => {
     expect(onToolCall).toHaveBeenCalledWith(event, session);
   });
 
+  it("separates opening directive from legacy response policy and sends it once on readiness", async () => {
+    let callbacks: RealtimeVoiceBridgeCallbacks | undefined;
+    const triggerGreeting = vi.fn();
+    const bridge = makeBridge({ triggerGreeting });
+    const session = createRealtimeVoiceBridgeSession({
+      provider: makeVoiceProvider((request) => {
+        callbacks = request;
+        return bridge;
+      }),
+      providerConfig: {},
+      instructions: "Full stock policy and synthetic backend context",
+      initialGreetingInstructions: "Full stock policy and synthetic backend context + opening",
+      initialGreetingDirective: "Say hello now, then listen.",
+      triggerGreetingOnReady: true,
+      audioSink: { sendAudio: vi.fn() },
+    });
+    callbacks?.onReady?.();
+    callbacks?.onReady?.();
+    expect(triggerGreeting).toHaveBeenCalledExactlyOnceWith(
+      "Full stock policy and synthetic backend context + opening",
+      { greetingDirective: "Say hello now, then listen." },
+    );
+    session.triggerGreeting("Explicit subsequent speech");
+    expect(triggerGreeting).toHaveBeenLastCalledWith("Explicit subsequent speech");
+    await session.close();
+    callbacks?.onReady?.();
+    expect(triggerGreeting).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports rejected initial greeting once without escaping the provider readiness callback", async () => {
+    let callbacks: RealtimeVoiceBridgeCallbacks | undefined;
+    const error = new Error("Opening directive rejected");
+    const triggerGreeting = vi.fn(() => {
+      throw error;
+    });
+    const onError = vi.fn();
+    const session = createRealtimeVoiceBridgeSession({
+      provider: makeVoiceProvider((request) => {
+        callbacks = request;
+        return makeBridge({ triggerGreeting });
+      }),
+      providerConfig: {},
+      initialGreetingDirective: "Opening only",
+      triggerGreetingOnReady: true,
+      audioSink: { sendAudio: vi.fn() },
+      onError,
+    });
+    expect(() => callbacks?.onReady?.()).not.toThrow();
+    callbacks?.onReady?.();
+    expect(triggerGreeting).toHaveBeenCalledOnce();
+    expect(onError).toHaveBeenCalledExactlyOnceWith(error);
+    await session.close();
+  });
+
   it("routes synchronous and asynchronous tool-call callback failures to onError", async () => {
     let callbacks: Parameters<RealtimeVoiceProviderPlugin["createBridge"]>[0] | undefined;
     const onError = vi.fn();

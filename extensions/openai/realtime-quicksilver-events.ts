@@ -14,7 +14,8 @@ export type OpenAIQuicksilverInboundEvent =
   | { kind: "transcript-delta"; role: "user" | "assistant"; text: string }
   | { kind: "transcript-done"; role: "user" | "assistant"; text: string }
   | { kind: "delegation"; id: string; prompt?: string }
-  | { kind: "error"; fatalAuth: boolean }
+  | { kind: "instructions-appended"; clientEventId: string }
+  | { kind: "error"; fatalAuth: boolean; clientEventId?: string }
   | { kind: "unknown"; eventType: string };
 
 const eventEnvelopeSchema = z.object({ type: z.string() });
@@ -91,6 +92,15 @@ const framelessSchemas = new Map<string, z.ZodType<OpenAIQuicksilverInboundEvent
 ]);
 
 const liveSchemas = new Map<string, z.ZodType<OpenAIQuicksilverInboundEvent>>([
+  [
+    "session.instructions.appended",
+    z
+      .object({ client_event_id: z.string().min(1), start_ms: z.number(), end_ms: z.number() })
+      .transform(({ client_event_id }) => ({
+        kind: "instructions-appended",
+        clientEventId: client_event_id,
+      })),
+  ],
   [
     "session.input_transcript.delta",
     liveTranscriptSchema.transform(({ delta }) => ({
@@ -178,7 +188,16 @@ export function parseOpenAIQuicksilverEvent(
   }
   const eventType = envelope.data.type;
   if (eventType === "error") {
-    return { kind: "error", fatalAuth: isFatalQuicksilverAuthError(decoded) };
+    const correlation = z
+      .object({ error: z.object({ client_event_id: z.string().optional() }) })
+      .safeParse(decoded);
+    return {
+      kind: "error",
+      fatalAuth: isFatalQuicksilverAuthError(decoded),
+      ...(correlation.success && correlation.data.error.client_event_id
+        ? { clientEventId: correlation.data.error.client_event_id }
+        : {}),
+    };
   }
   if (eventType === "session.updated") {
     return { kind: "ignored", eventType };

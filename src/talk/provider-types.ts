@@ -341,7 +341,9 @@ export type RealtimeVoiceBridge = {
     text: string,
     options?: { toolChoice?: { type: "function"; name: string } },
   ): void;
-  triggerGreeting?(instructions?: string): void;
+  /** Legacy response instructions remain separate from the bounded opening directive.
+   * Continuous providers must not replay the full session policy as speakable context. */
+  triggerGreeting?(instructions?: string, options?: { greetingDirective: string }): void;
   handleBargeIn?(options?: RealtimeVoiceBargeInOptions): void;
   /**
    * Returns void when submission completes synchronously, or a Promise that resolves at the

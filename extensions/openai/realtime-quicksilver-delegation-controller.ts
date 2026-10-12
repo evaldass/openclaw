@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { PluginLogger } from "openclaw/plugin-sdk/plugin-entry";
 import type {
   RealtimeVoiceAgentConsultRunner,
@@ -93,6 +94,8 @@ function projectWireEventType(
       return "turn.done";
     case "delegation":
       return live ? "session.delegation.created" : "delegation.created";
+    case "instructions-appended":
+      return "session.instructions.appended";
     case "error":
       return "error";
     case "ignored":
@@ -105,6 +108,15 @@ function projectWireEventType(
 
 /** Owns the provider's single active delegation and its once-consumed transcript context. */
 export class OpenAIQuicksilverDelegationController {
+  private readonly greetingEventPrefix = `greeting_${randomUUID()}_`;
+  private greetingSequence = 0;
+  private readonly greetingAppends = new Map<
+    string,
+    {
+      socket: OpenAIQuicksilverSocket;
+      timeout: ReturnType<typeof setTimeout>;
+    }
+  >();
   private activeDelegationId: string | undefined;
   private readonly completionClaimsAdopted: boolean;
   private consultController: AbortController | undefined;
@@ -225,7 +237,27 @@ export class OpenAIQuicksilverDelegationController {
       }
       return;
     }
+    if (event.kind === "instructions-appended") {
+      if (this.settleGreetingAppend(event.clientEventId)) {
+        // Accepted context is not a spoken turn, playback receipt, or user affirmation.
+        this.options.logger.debug?.(
+          "GPT-Live greeting instructions accepted; speech is unconfirmed",
+        );
+      }
+      return;
+    }
     if (event.kind === "error") {
+      if (event.clientEventId?.startsWith(this.greetingEventPrefix)) {
+        if (this.settleGreetingAppend(event.clientEventId) && !event.fatalAuth) {
+          this.options.onError?.(
+            new Error("GPT-Live greeting instructions were rejected; speech is unconfirmed"),
+          );
+        }
+        // Late/duplicate errors for this command cannot fail a replacement session.
+        if (!event.fatalAuth) {
+          return;
+        }
+      }
       const error = new Error(projectOpenAIQuicksilverErrorMessage("provider"));
       this.options.logger.warn(error.message);
       if (event.fatalAuth) {
@@ -259,11 +291,75 @@ export class OpenAIQuicksilverDelegationController {
     }
   }
 
+  /** One bounded application command; never chunk a session policy into speech. */
+  sendGreetingInstructions(text: string): void {
+    if (this.stopped || this.drainDisposition || this.options.signal.aborted) {
+      return;
+    }
+    const socket = this.options.getSocket();
+    if (!socket || socket.readyState !== WEBSOCKET_OPEN) {
+      throw new Error("GPT-Live greeting requires an active session socket");
+    }
+    const content = text.trim();
+    // The documented append limit is 500 tokens. A 500-byte ceiling is a conservative
+    // token bound for arbitrary UTF-8 text, avoiding a tokenizer dependency or chunking.
+    if (!content || Buffer.byteLength(content, "utf8") > 500) {
+      throw new Error("GPT-Live greeting directive must contain 1–500 UTF-8 bytes");
+    }
+    const eventId = `${this.greetingEventPrefix}${++this.greetingSequence}`;
+    const timeout = setTimeout(() => {
+      if (this.settleGreetingAppend(eventId)) {
+        this.options.onError?.(
+          new Error("GPT-Live greeting acknowledgment timed out; speech is unconfirmed"),
+        );
+      }
+    }, 15_000);
+    timeout.unref?.();
+    this.greetingAppends.set(eventId, { socket, timeout });
+    try {
+      socket.send(
+        JSON.stringify({
+          type: "session.instructions.append",
+          event_id: eventId,
+          delegation_id: null,
+          content,
+        }),
+      );
+    } catch {
+      this.settleGreetingAppend(eventId);
+      throw new Error("GPT-Live greeting instructions could not be sent");
+    }
+  }
+
+  private settleGreetingAppend(eventId: string): boolean {
+    const pending = this.greetingAppends.get(eventId);
+    if (!pending) {
+      return false;
+    }
+    clearTimeout(pending.timeout);
+    this.greetingAppends.delete(eventId);
+    return (
+      !this.stopped &&
+      !this.drainDisposition &&
+      !this.options.signal.aborted &&
+      pending.socket === this.options.getSocket() &&
+      pending.socket.readyState === WEBSOCKET_OPEN
+    );
+  }
+
+  private cancelGreetingAppends(): void {
+    for (const pending of this.greetingAppends.values()) {
+      clearTimeout(pending.timeout);
+    }
+    this.greetingAppends.clear();
+  }
+
   beginTranscriptDrain(disposition: "abort" | "detach"): void {
     if (this.stopped || this.drainDisposition) {
       return;
     }
     this.drainDisposition = disposition;
+    this.cancelGreetingAppends();
     this.publicDelegations?.stop();
     this.revokeRequesterFinal();
     this.pendingDelegation = undefined;
@@ -454,6 +550,7 @@ export class OpenAIQuicksilverDelegationController {
 
   private markStopped(): void {
     this.stopped = true;
+    this.cancelGreetingAppends();
     this.revokeRequesterFinal();
     this.options.signal.removeEventListener("abort", this.onSessionAbort);
     this.pendingDelegation = undefined;

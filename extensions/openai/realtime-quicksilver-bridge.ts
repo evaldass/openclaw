@@ -450,7 +450,11 @@ export class OpenAIQuicksilverVoiceBridge implements RealtimeVoiceBridge {
     settleReady: () => void,
     failStartup: (reason: string) => void,
   ): void {
-    if (event.kind === "ignored" || event.kind === "unknown") {
+    if (
+      event.kind === "ignored" ||
+      event.kind === "unknown" ||
+      event.kind === "instructions-appended"
+    ) {
       return;
     }
     if (event.kind === "session-started") {

@@ -168,6 +168,26 @@ Register each capability inside `register(api)` alongside your existing
     GPT-Live owns agent delegation and interruption but does not support
     host-enforced wake-name gating, even though GA OpenAI Realtime does.
 
+    Keep startup policy separate from an application-authored opening. The existing
+    `triggerGreeting(instructions?, { greetingDirective })` contract accepts an
+    optional standalone directive alongside legacy response instructions.
+    `createRealtimeVoiceBridgeSession` carries that directive as
+    `initialGreetingDirective` and sends the initial greeting once on readiness.
+    Response-driven adapters retain the first argument's behavior; continuous
+    GPT-Live Gateway adapters use only the standalone directive, never replaying
+    the startup policy into speech-directed context. Supply complete policy through
+    `instructions` at session creation as before. Callers already passing only a
+    short opening can continue using the first argument alone.
+
+    The GPT-Live Gateway adapter sends one `session.instructions.append` command
+    with a session-wide `delegation_id: null` and a correlated event ID. Its local
+    directive limit is 500 UTF-8 bytes (a conservative bound for the API's 500-token
+    append limit); oversized directives are rejected rather than truncated or
+    streamed as commentary. Acceptance acknowledgment, rejection, and a 15-second
+    local acknowledgment timeout are tracked independently of speech. Acceptance
+    is not a playback receipt, completed conversational turn, or caller consent;
+    audio input remains running. No acknowledgment causes a retry.
+
     ```typescript
     api.registerRealtimeVoiceProvider({
       id: "acme-ai",

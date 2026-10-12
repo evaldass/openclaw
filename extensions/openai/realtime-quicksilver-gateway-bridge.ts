@@ -180,8 +180,18 @@ export class OpenAIQuicksilverGatewayBridge implements RealtimeVoiceBridge {
     this.delegations?.sendSessionContext(text, "speakable");
   }
 
-  triggerGreeting(instructions?: string): void {
-    this.sendUserMessage(instructions?.trim() || "Greet the user briefly.");
+  triggerGreeting(instructions?: string, options?: { greetingDirective: string }): void {
+    if (this.closed) {
+      return;
+    }
+    const directive = options?.greetingDirective ?? instructions;
+    if (isOpenAIGptLiveApiModel(this.config.model)) {
+      this.delegations?.sendGreetingInstructions(
+        directive?.trim() || "Greet the user now briefly, then pause and listen.",
+      );
+    } else {
+      this.sendUserMessage(instructions?.trim() || "Greet the user briefly.");
+    }
   }
 
   submitToolResult(): void {

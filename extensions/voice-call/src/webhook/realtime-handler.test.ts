@@ -459,7 +459,8 @@ describe("RealtimeCallHandler path routing", () => {
       state: "answered",
       metadata: { initialMessage: "hello" },
     });
-    const resolveInstructions = vi.fn((record: CallRecord) => `instructions:${record.agentId}`);
+    const policy = "instructions:support\nSYNTHETIC_PRIVATE_RUBRIC";
+    const resolveInstructions = vi.fn(() => policy);
     const triggerGreeting = vi.fn();
     const { handler, callbacks, processEvent, createBridge } = makeCallHarness(
       { triggerGreeting },
@@ -491,11 +492,19 @@ describe("RealtimeCallHandler path routing", () => {
     const eventTypes = processEvent.mock.calls.map(([event]) => event.type);
     expect(eventTypes).toEqual(["call.answered"]);
     expect(processEvent.mock.calls[0]?.[0].callId).toBe("call-1");
-    expect(createBridge.mock.calls[0]?.[0].instructions).toBe("instructions:support");
+    expect(createBridge.mock.calls[0]?.[0].instructions).toBe(policy);
     expect(createBridge.mock.calls[0]?.[0].agentId).toBe("support");
     callbacks[0]?.onReady?.();
     expect(triggerGreeting).toHaveBeenCalledTimes(1);
-    expect(triggerGreeting.mock.calls[0]?.[0]).toContain("hello");
+    expect(triggerGreeting.mock.calls[0]?.[0]).toBe(
+      `${policy}\n\nStart the call by greeting the caller naturally. Include this greeting in your first spoken reply: "hello"`,
+    );
+    expect(triggerGreeting.mock.calls[0]?.[1]).toEqual({
+      greetingDirective:
+        'Greet the caller now. Say this greeting naturally, then pause and listen: "hello"',
+    });
+    callbacks[0]?.onReady?.();
+    expect(triggerGreeting).toHaveBeenCalledTimes(1);
   });
 
   it("rejects stream sessions when token expiry would exceed the Date range", async () => {

@@ -30,6 +30,22 @@ describe("OpenAI realtime outgoing response ownership", () => {
   beforeEach(resetTestState);
   afterEach(restoreTestEnvironment);
 
+  it("keeps GA greeting response instructions unchanged when an isolated Live directive is supplied", async () => {
+    const bridge: RealtimeVoiceBridge = createNativeBridge({ autoRespondToAudio: false });
+    const socket = await connectReadyBridge(bridge);
+    const legacy = "Stock policy + synthetic context + first reply";
+    bridge.triggerGreeting?.(legacy, { greetingDirective: "Hello only" });
+    expect(parseSent(socket)).toContainEqual({
+      type: "conversation.item.create",
+      item: { type: "message", role: "user", content: [{ type: "input_text", text: legacy }] },
+    });
+    expect(parseSent(socket).some((event) => event.type === "response.create")).toBe(true);
+    expect(parseSent(socket).some((event) => event.type === "session.instructions.append")).toBe(
+      false,
+    );
+    await bridge.close();
+  });
+
   it.each(["manual", "standalone"])(
     "sends %s creation before its observer can cancel",
     async (mode) => {
