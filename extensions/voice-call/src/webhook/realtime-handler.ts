@@ -3,6 +3,7 @@ import http from "node:http";
 import type { Duplex } from "node:stream";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import {
   isFutureDateTimestampMs,
   resolveExpiresAtMsFromDurationMs,
@@ -121,6 +122,25 @@ export type StreamSession = {
   streamUrl: string;
 };
 
+export type RealtimeMediaTransport = {
+  readonly readyState: number;
+  readonly bufferedAmount: number;
+  send: (message: string) => void;
+  close: (code?: number, reason?: string) => void;
+};
+export class RealtimeCallCleanupError extends Error {
+  constructor() {
+    super("Realtime provider/transcript cleanup failed");
+  }
+}
+
+export type RealtimeRoomBinding = {
+  sendAudio: (audio: Buffer) => void;
+  /** Carrier-owned disposal, without joining a manager termination that may call back here. */
+  endCall: () => Promise<void>;
+  acknowledgeMark: (name: string) => void;
+};
+
 type RealtimeCallRegistration = {
   agentId: string;
   instructions: string;
@@ -207,7 +227,7 @@ type RealtimeTelephonyBinding = {
   bridge: ActiveRealtimeVoiceBridge;
   acknowledgeCarrierMark: (markName?: string) => void;
   close: (cause?: RealtimeCallEndCause) => Promise<void>;
-  endCall: () => void;
+  endCall: () => Promise<void>;
   noteMediaActivity: () => void;
   playVoicemail: (instructions: string) => Promise<void>;
   retire: () => void;
@@ -216,8 +236,9 @@ type RealtimeTelephonyBinding = {
 export class RealtimeCallHandler {
   private readonly toolHandlers = new Map<string, ToolHandlerFn>();
   private readonly pendingStreamTokens = new Map<string, PendingStreamToken>();
+  private readonly roomBindings = new Set<RealtimeTelephonyBinding>();
   private readonly activeSockets = new Set<WebSocket>();
-  private readonly serverClosingSockets = new WeakSet<WebSocket>();
+  private readonly serverClosingSockets = new WeakSet<RealtimeMediaTransport>();
   private readonly activeBridgesByCallId = new Map<string, ActiveRealtimeVoiceBridge>();
   private readonly activeTelephonyBindingsByCallId = new Map<string, RealtimeTelephonyBinding>();
   private readonly forcedConsultsByCallId = new Map<string, ForcedConsultState>();
@@ -456,6 +477,7 @@ export class RealtimeCallHandler {
     const sockets = [...this.activeSockets];
     this.closePromise = Promise.allSettled([
       shutdownBarrier,
+      ...[...this.roomBindings].map((binding) => binding.close("shutdown")),
       ...sockets.map(
         (ws) =>
           new Promise<void>((resolve) => {
@@ -579,12 +601,60 @@ export class RealtimeCallHandler {
     return request;
   }
 
+  /** Attach an authenticated RTC room after manager admission, without a public media WebSocket. */
+  async attachRoomTransport(params: {
+    callId: string;
+    providerCallId: string;
+    streamId: string;
+    transport: RealtimeMediaTransport;
+  }): Promise<RealtimeRoomBinding | null> {
+    if (this.closing) {
+      return null;
+    }
+    const admission = this.handleCall(
+      params.streamId,
+      params.providerCallId,
+      params.transport,
+      { callId: params.callId },
+      new StreamFrameAdapter("twilio"),
+      true,
+    );
+    this.trackShutdownWork(
+      admission.then(() => {}),
+      this.admissions,
+    );
+    const admitted = await admission;
+    if (!admitted) {
+      return null;
+    }
+    if (this.closing) {
+      // RTC admission still belongs to the carrier join. Terminating the manager
+      // here would await hangupCall, which must itself join this admission.
+      void admitted.close("shutdown").catch(() => {});
+      await admitted.endCall();
+      return null;
+    }
+    this.roomBindings.add(admitted);
+    return {
+      sendAudio: (audio) => {
+        admitted.noteMediaActivity();
+        admitted.bridge.sendAudio(audio);
+      },
+      endCall: () => {
+        this.roomBindings.delete(admitted);
+        return admitted.endCall();
+      },
+      acknowledgeMark: (name) => admitted.acknowledgeCarrierMark(name),
+    };
+  }
+
   private async handleCall(
     streamSid: string,
     callSid: string,
-    ws: WebSocket,
+    ws: RealtimeMediaTransport,
     callerMeta: Omit<PendingStreamToken, "expiry">,
-    adapter: StreamFrameAdapter,
+    adapter: Pick<StreamFrameAdapter, "serializeMedia" | "serializeClear" | "serializeMark">,
+    carrierOwnsAdmission = false,
   ): Promise<RealtimeTelephonyBinding | null> {
     const preparedCall = await this.prepareCallInManager(callSid, callerMeta);
     if (!preparedCall) {
@@ -629,7 +699,10 @@ export class RealtimeCallHandler {
       }
       if (!this.activeBridgesByCallId.has(callId)) {
         if (this.closing || this.serverClosingSockets.has(ws)) {
-          await emitCallEnd("shutdown");
+          const completion = emitCallEnd("shutdown");
+          if (!carrierOwnsAdmission) {
+            await completion;
+          }
         } else {
           this.streamDisconnectLifecycle.connect(callSid, streamSid);
           this.streamDisconnectLifecycle.disconnect(callSid, streamSid);
@@ -772,6 +845,7 @@ export class RealtimeCallHandler {
         : undefined;
     // Providers may close synchronously before createBridge returns; no consult can exist yet.
     let nativeConsultOwner: ActiveRealtimeVoiceBridge | undefined = undefined;
+    let provisionalCloseReason: "completed" | "error" | undefined;
     const { audioPacer, pendingMarkAcks, outboundGreeting, audioController, activity, hostSpeech } =
       createRealtimeCallPlayback({
         ws,
@@ -1115,7 +1189,8 @@ export class RealtimeCallHandler {
         });
         const owner = nativeConsultOwner;
         if (!owner) {
-          // Providers begin producing events after connect(), not during construction.
+          // RTC admission cannot publish a bridge that terminated during construction.
+          provisionalCloseReason = reason;
           return;
         }
         if (sessionClosed) {
@@ -1147,7 +1222,16 @@ export class RealtimeCallHandler {
     } catch (error) {
       console.error("[voice-call] Failed to create realtime bridge:", error);
     }
-    if (!candidate) {
+    if (!candidate || (carrierOwnsAdmission && provisionalCloseReason)) {
+      let cleanupFailed = false;
+      try {
+        await drainProviderClose(() => candidate?.close());
+      } catch (error) {
+        cleanupFailed = true;
+        console.warn(
+          `[voice-call] Failed to close provisional realtime bridge ${callSid}: ${formatErrorMessage(error)}`,
+        );
+      }
       harness.close();
       audioPacer.close();
       outboundGreeting.close();
@@ -1158,6 +1242,9 @@ export class RealtimeCallHandler {
       }
       if (ws.readyState === WebSocket.OPEN) {
         ws.close(1011, "Failed to create realtime bridge");
+      }
+      if (cleanupFailed && carrierOwnsAdmission) {
+        throw new RealtimeCallCleanupError();
       }
       return null;
     }
@@ -1210,7 +1297,9 @@ export class RealtimeCallHandler {
       activity.close();
       this.cancelConsultSession(callId, session, harness.forcedConsults);
       audioPacer.close();
-      sessionClosePromise = drainProviderClose(closeSession).finally(() => {
+      const completion = createDeferred<void>();
+      sessionClosePromise = completion.promise;
+      const work = drainProviderClose(closeSession).finally(() => {
         for (const key of [callId, callSid]) {
           if (this.activeBridgesByCallId.get(key) === session) {
             this.activeBridgesByCallId.delete(key);
@@ -1219,14 +1308,16 @@ export class RealtimeCallHandler {
         clearRecentFinalUserTranscript(userTranscriptOwner);
         harness.close();
       });
+      void work.then(completion.resolve, completion.reject);
       return sessionClosePromise;
     };
 
     let bindingClosed = false;
     let bindingClosePromise: Promise<void> | undefined;
+    let bindingCompletionPromise: Promise<void> | undefined;
     const closeBinding = (cause?: RealtimeCallEndCause): Promise<void> => {
       if (bindingClosed) {
-        return bindingClosePromise ?? callEndPromise ?? Promise.resolve();
+        return (cause ? bindingCompletionPromise : bindingClosePromise) ?? Promise.resolve();
       }
       bindingClosed = true;
       activity.close();
@@ -1241,27 +1332,30 @@ export class RealtimeCallHandler {
         } else {
           this.streamDisconnectLifecycle.retire(callSid, streamSid);
         }
-        if (ownsCall && stillOwnsCall && cause && cause !== "disconnect") {
-          return emitCallEnd(cause);
-        }
-        return Promise.resolve();
+        return ownsCall && stillOwnsCall;
       };
-      let pending: Promise<void>;
-      try {
-        pending = Promise.resolve(session.close());
-      } catch (error) {
-        pending = Promise.reject(
-          error instanceof Error
-            ? error
-            : new Error("Realtime provider close failed", { cause: error }),
-        );
-      }
-      bindingClosePromise = pending.then(finishClose, async (error: unknown) => {
+      const providerDisposal = createDeferred<void>();
+      const pending = providerDisposal.promise;
+      // The disposal promise excludes manager termination: hangupCall can reenter
+      // endCall while the outer close is waiting for manager.endCall.
+      let shouldEndCall = false;
+      bindingClosePromise = pending.then(
+        () => {
+          shouldEndCall = finishClose();
+        },
+        (error: unknown) => {
+          shouldEndCall = finishClose();
+          throw error;
+        },
+      );
+      const terminate = () =>
+        shouldEndCall && cause && cause !== "disconnect" ? emitCallEnd(cause) : Promise.resolve();
+      const completion = bindingClosePromise.then(terminate, async (error: unknown) => {
         console.warn(
           `[voice-call] Failed to close realtime bridge ${callSid}: ${formatErrorMessage(error)}`,
         );
         try {
-          await finishClose();
+          await terminate();
         } catch (terminationError) {
           throw new AggregateError([error, terminationError], "Realtime call cleanup failed", {
             cause: terminationError,
@@ -1269,8 +1363,19 @@ export class RealtimeCallHandler {
         }
         throw error;
       });
-      this.trackShutdownWork(bindingClosePromise, this.terminationAttempts);
-      return bindingClosePromise;
+      bindingCompletionPromise = completion;
+      this.trackShutdownWork(completion, this.terminationAttempts);
+      // Publish both promises before provider.close can synchronously close the
+      // carrier and reenter this binding through manager.hangupCall.
+      try {
+        void Promise.resolve(session.close()).then(
+          providerDisposal.resolve,
+          providerDisposal.reject,
+        );
+      } catch (error) {
+        providerDisposal.reject(error);
+      }
+      return cause ? completion : bindingClosePromise;
     };
     const telephonyBinding: RealtimeTelephonyBinding = {
       bridge: session,
@@ -1291,10 +1396,11 @@ export class RealtimeCallHandler {
       endCall: () => {
         // Close the provider session before the carrier socket so no pending
         // response can reach the caller after the hang-up request succeeds.
-        void closeBinding();
+        const disposal = closeBinding();
         if (ws.readyState === WebSocket.OPEN) {
           ws.close(1000, "Call ended");
         }
+        return disposal;
       },
       noteMediaActivity: () => activity.noteMedia(),
       playVoicemail: (speechInstructions) => hostSpeech.speak(speechInstructions),
@@ -1611,7 +1717,7 @@ export class RealtimeCallHandler {
       payload: { name: REALTIME_VOICE_END_CALL_TOOL_NAME, result: { success: true } },
       final: true,
     });
-    binding.endCall();
+    await binding.endCall();
   }
 
   private async executeToolCall(
