@@ -33,19 +33,28 @@ archive is not a trusted official publication. Allowlists, renaming, link instal
 and copied install records do not grant privileged durable state. Never override
 provenance or weaken a trust guard to pass acceptance.
 
-## Known shipping-host boundary
+## Stable host contract
 
-The checked OpenClaw 2026.9.9 build
-`bcfc88812a35243893585dbeca87ca41b48272ca` does not implement the service V2
-scheduler used by this candidate. Its SDK lacks `resolvePluginServiceScheduler`,
-and its service context lacks `scheduler`. Exporting a resolver alone is therefore
-insufficient. The candidate scheduler owns callback execution context,
-cancellation and joined shutdown; a local timer shim is not equivalent.
+This candidate is based on OpenClaw 2026.10.1 (`v2026.10.1`,
+`e178c39e9aae3fa440735217f9aef9574f286677`). That release already supplies the
+service V2 context's `scheduler`, `PluginServiceSchedulerV1`, and the public
+`resolvePluginServiceScheduler` resolver. Keep these stock service and CLI
+bindings: the scheduler owns callback execution context, cancellation, and joined
+shutdown. No resolver backport or local timer shim is needed.
 
-That shipping core also lacks this branch's detached realtime-consult admission
-repair. Installing a plugin cannot replace the host consultation implementation.
-Use a complete matching reviewed host, or separately review a full backport/port.
-Semantic version strings alone cannot prove these APIs exist.
+The port retains a narrow host consultation repair using the release's existing
+`runWithGatewayDetachedWorkAdmission` owner. Delayed RTC consultations get fresh
+root admission after their triggering request has released, while retaining
+restart/suspension fences and cancellation. Installing only the plugin into an
+unmodified host cannot replace that consultation implementation; use the complete
+matching reviewed host and its bundled plugin. The stable database schema
+versions remain unchanged (state 20 and agent 24).
+
+For historical context, the previously checked OpenClaw 2026.9.9 build
+`bcfc88812a35243893585dbeca87ca41b48272ca` lacked both the full scheduler contract
+and the detached consultation repair. That older negative result does not apply
+to the scheduler supplied by this stable base. Semantic version strings alone
+cannot prove APIs or the additional host repair exist.
 
 ## Acceptance and rollback
 
