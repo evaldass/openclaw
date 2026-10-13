@@ -241,6 +241,11 @@ export async function connectLiveKitAudio(
     void task.finally(() => tasks.delete(task));
   });
   try {
+    // The SDK import may outlive manager admission. A room JWT is still valid
+    // after retirement, so revalidate before submitting the native connection.
+    if (!current()) {
+      throw new Error("RTC room admission cancelled");
+    }
     connectPromise = room.connect(params.url, params.token, {
       autoSubscribe: false,
       dynacast: false,

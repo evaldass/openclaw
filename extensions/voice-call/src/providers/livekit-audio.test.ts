@@ -13,6 +13,7 @@ const mock = vi.hoisted(() => ({
   clear: vi.fn(),
   close: vi.fn(async () => {}),
   publish: vi.fn(async () => {}),
+  connect: vi.fn(async () => {}),
   disconnect: vi.fn(async () => {}),
   subscribed: vi.fn(),
   room: undefined as EventEmitter | undefined,
@@ -40,7 +41,7 @@ vi.mock("@livekit/rtc-node", async () => {
       super();
       mock.room = this;
     }
-    async connect() {}
+    connect = mock.connect;
     disconnect = mock.disconnect;
   }
   return {
@@ -193,14 +194,23 @@ it("terminates on foreign peer or RTC disconnect and prevents audio after cancel
   expect(mock.capture).not.toHaveBeenCalled();
 });
 
-it("rejects manager cancellation during RTC admission", async () => {
-  const h = harness();
-  await expect(connectLiveKitAudio({ ...h.params, isCurrent: () => false })).rejects.toThrow(
-    "LiveKit RTC audio connection failed",
-  );
-  expect(mock.publish).not.toHaveBeenCalled();
-  expect(h.params.handler.attachRoomTransport).not.toHaveBeenCalled();
-});
+it.each([false, true])(
+  "does not connect when admission retires during the native SDK import (initially current: %s)",
+  async (initiallyCurrent) => {
+    const h = harness();
+    let current = initiallyCurrent;
+    const admission = connectLiveKitAudio({ ...h.params, isCurrent: () => current });
+    // The production entry point has yielded at its dynamic import. Retire the
+    // manager admission before the SDK continuation can submit a room token.
+    current = false;
+    await expect(admission).rejects.toThrow("LiveKit RTC audio connection failed");
+    expect(mock.connect).not.toHaveBeenCalled();
+    expect(mock.publish).not.toHaveBeenCalled();
+    expect(h.params.handler.attachRoomTransport).not.toHaveBeenCalled();
+    expect(mock.disconnect).toHaveBeenCalledOnce();
+    expect(mock.close).toHaveBeenCalledOnce();
+  },
+);
 
 it("acknowledges a 160ms prefix during sustained captures and cancels stale marks on clear/close", async () => {
   vi.useFakeTimers();

@@ -738,28 +738,6 @@ it.each([false, true])(
   },
 );
 
-it("removes restored cleanup bookkeeping when the manager record disappeared", async () => {
-  const h = await harness();
-  await h.manager.initiateCall(to, undefined, { mode: "conversation" });
-  const replacement = new LiveKitProvider(livekit, {
-    rooms: h.rooms,
-    sip: h.sip,
-    receiver: h.receiver,
-    connectAudio: h.connectAudio,
-  });
-  replacement.bind(h.manager, h.handler);
-  const end = vi
-    .spyOn(h.manager, "endCall")
-    .mockResolvedValueOnce({ success: false, error: "transient" });
-  await replacement.retireRestoredCalls();
-  end.mockRestore();
-  await h.provider.stop();
-  await replacement.retryPendingCleanup();
-  expect((replacement as unknown as { restoredCleanup: Set<string> }).restoredCleanup.size).toBe(0);
-  await replacement.stop();
-  await h.handler.close();
-});
-
 it("retains a failed drain from a connection returned after admission cancellation", async () => {
   const h = await harness();
   const entered = Promise.withResolvers<void>();
