@@ -55,9 +55,10 @@ it.each([
     status: "completed",
     isTerminal: true,
   });
-  expect(String(fetch.mock.calls[0]?.[0])).toBe(
-    `${host}/twirp/livekit.RoomService/ListParticipants`,
-  );
+  const request = fetch.mock.calls[0]?.[0];
+  const requestUrl =
+    request instanceof URL ? request.href : typeof request === "string" ? request : request?.url;
+  expect(requestUrl).toBe(`${host}/twirp/livekit.RoomService/ListParticipants`);
   const unsigned = await provider.verifyWebhook({
     headers: {},
     rawBody: "{}",

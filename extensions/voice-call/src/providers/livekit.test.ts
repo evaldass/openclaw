@@ -14,10 +14,7 @@ import {
   type RealtimeVoiceProviderPlugin,
 } from "openclaw/plugin-sdk/realtime-voice";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  validateProviderConfig,
-  normalizeVoiceCallConfig,
-} from "../config.js";
+import { validateProviderConfig, normalizeVoiceCallConfig } from "../config.js";
 import { CallManager } from "../manager.js";
 import {
   createTestStorePath,
@@ -153,10 +150,9 @@ async function harness(
   installVoiceCallStateRuntimeForTests();
   const manager = registerTestManagerCleanup(new CallManager(config, createTestStorePath()));
   await manager.initialize(provider, "https://voice.example.test/webhook");
-  const bridge = createBridge(
-    vi.fn(async () => {}),
-    { sendAudio: vi.fn() },
-  );
+  const bridgeSendAudio = vi.fn();
+  const bridgeClose = vi.fn(async () => {});
+  const bridge = createBridge(bridgeClose, { sendAudio: bridgeSendAudio });
   const createModelBridge = vi.fn<RealtimeVoiceProviderPlugin["createBridge"]>(() => bridge);
   const realtime = makeRealtimeProvider(createModelBridge);
   const handler = new RealtimeCallHandler(
@@ -196,6 +192,8 @@ async function harness(
   };
   return {
     bridge,
+    bridgeSendAudio,
+    bridgeClose,
     createModelBridge,
     provider,
     manager,
@@ -258,7 +256,7 @@ describe("LiveKit telephony lifecycle", () => {
     });
     expect(binding).not.toBeNull();
     binding!.sendAudio(Buffer.from([255, 255, 255]));
-    expect(h.bridge.sendAudio).toHaveBeenCalledWith(Buffer.from([255, 255, 255]));
+    expect(h.bridgeSendAudio).toHaveBeenCalledWith(Buffer.from([255, 255, 255]));
     const options = h.createModelBridge.mock.calls[0]![0];
     expect(options.instructions).toBe(
       `${DEFAULT_VOICE_CALL_REALTIME_INSTRUCTIONS}\n\nUse native agent delegation for OpenClaw work. To end the current call, say out loud that you are hanging up and delegate; the OpenClaw agent acts on the transcript. Other custom realtime function tools are unavailable in this session.`,
@@ -273,7 +271,7 @@ describe("LiveKit telephony lifecycle", () => {
     await binding!.endCall();
     await h.handler.close();
     await h.provider.stop();
-    expect(h.bridge.close).toHaveBeenCalled();
+    expect(h.bridgeClose).toHaveBeenCalled();
   });
 
   it("preserves the default prompt and built-in function tools over RTC", async () => {
@@ -525,7 +523,10 @@ it("requires signed webhooks, valid server URL, and realtime audio", () => {
   });
   expect(validateProviderConfig(config).errors).toContain("LiveKit requires realtime.enabled");
   expect(() =>
-    normalizeVoiceCallConfig({ livekit: { ...livekit, url: "http://insecure.test" } }),
+    normalizeVoiceCallConfig({
+      provider: "livekit",
+      livekit: { ...livekit, url: "http://insecure.test" },
+    }),
   ).toThrow();
 });
 

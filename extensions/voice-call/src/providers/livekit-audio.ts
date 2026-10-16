@@ -1,5 +1,6 @@
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { convertPcmToMulaw8k, mulawToPcm } from "openclaw/plugin-sdk/realtime-voice";
+import { asOptionalRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   RealtimeCallCleanupError,
   type RealtimeCallHandler,
@@ -117,11 +118,12 @@ export async function connectLiveKitAudio(
       if (!current()) {
         return;
       }
-      const frame = JSON.parse(String(raw)) as {
-        event: string;
-        media?: { payload: string };
-        mark?: { name: string };
-      };
+      const frame = asOptionalRecord(JSON.parse(raw));
+      if (!frame) {
+        return;
+      }
+      const media = asOptionalRecord(frame.media);
+      const mark = asOptionalRecord(frame.mark);
       if (frame.event === "clear") {
         generation++;
         source.clearQueue();
@@ -129,8 +131,8 @@ export async function connectLiveKitAudio(
         return;
       }
       const owner = generation;
-      if (frame.event === "media" && frame.media) {
-        const pcm = mulawToPcm(Buffer.from(frame.media.payload, "base64"));
+      if (frame.event === "media" && typeof media?.payload === "string") {
+        const pcm = mulawToPcm(Buffer.from(media.payload, "base64"));
         const samples = new Int16Array(pcm.length / 2);
         for (let i = 0; i < samples.length; i++) {
           samples[i] = pcm.readInt16LE(i * 2);
@@ -147,8 +149,8 @@ export async function connectLiveKitAudio(
             }
           })
           .catch(() => disconnected("error"));
-      } else if (frame.event === "mark" && frame.mark) {
-        const name = frame.mark.name;
+      } else if (frame.event === "mark" && typeof mark?.name === "string") {
+        const name = mark.name;
         // Capture ordering fixes the mark's native queue position. queuedDuration
         // is milliseconds; later captures re-arm the SDK drain waiter, so never
         // use waitForPlayout for a prefix acknowledgement.

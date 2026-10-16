@@ -408,7 +408,7 @@ it.each(["manager", "room_finished", "rtc"] as const)(
       }
       const outcome = work.then(
         (result) => ({ result }),
-        (error) => ({ error }),
+        (error: unknown) => ({ error }),
       );
       await h.closeEntered.promise;
       h.finishClose.resolve();
@@ -492,7 +492,7 @@ it.each(["carrier", "terminal-persistence"] as const)(
       vi.mocked(h.rooms.deleteRoom).mockRejectedValueOnce(new Error("Transient deletion failure"));
     }
     const first = h.webhook("room_finished");
-    const rejected = first.catch((error) => error);
+    const rejected = first.catch((error: unknown) => error);
     try {
       await h.closeEntered.promise;
       h.finishClose.resolve();
@@ -542,7 +542,7 @@ it.each(["ttl", "capacity"] as const)(
       }
       await original(...args);
     });
-    const first = h.webhook("room_finished").catch((error) => error);
+    const first = h.webhook("room_finished").catch((error: unknown) => error);
     let clock: ReturnType<typeof vi.spyOn> | undefined;
     try {
       await h.closeEntered.promise;

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   AccessToken,
+  ParticipantInfo,
   ServerError,
   RoomServiceClient,
   SipClient,
@@ -32,6 +33,9 @@ import {
   LiveKitAudioCleanupError,
   type LiveKitAudioConnection,
 } from "./livekit-audio.js";
+
+// Resolve the protobuf enum through the public server SDK (which does not export Kind).
+const SIP_PARTICIPANT_KIND = ParticipantInfo.fromJson({ kind: "SIP" }).kind;
 
 type CallRoom = {
   room: string;
@@ -291,7 +295,11 @@ export class LiveKitProvider implements VoiceCallProvider {
       return { events: [] };
     }
     const participant = event.participant;
-    if (!call && event.event === "participant_joined" && participant?.kind === 3) {
+    if (
+      !call &&
+      event.event === "participant_joined" &&
+      participant?.kind === SIP_PARTICIPANT_KIND
+    ) {
       const attrs = participant.attributes;
       if (this.stopping || !this.manager || !this.handler || this.restoredCleanup.has(room)) {
         this.rejectRoom(room);
@@ -597,8 +605,8 @@ export class LiveKitProvider implements VoiceCallProvider {
     try {
       const participants = await this.deps.rooms.listParticipants(input.providerCallId);
       return {
-        status: participants.some((p) => p.kind === 3) ? "active" : "completed",
-        isTerminal: !participants.some((p) => p.kind === 3),
+        status: participants.some((p) => p.kind === SIP_PARTICIPANT_KIND) ? "active" : "completed",
+        isTerminal: !participants.some((p) => p.kind === SIP_PARTICIPANT_KIND),
       };
     } catch (error) {
       if (error instanceof ServerError && error.code === "not_found") {

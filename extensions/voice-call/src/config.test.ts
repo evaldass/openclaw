@@ -1,6 +1,9 @@
 // Voice Call tests cover config plugin behavior.
 import fs from "node:fs";
-import { validateJsonSchemaValue, type JsonSchemaObject } from "openclaw/plugin-sdk/json-schema-runtime";
+import {
+  validateJsonSchemaValue,
+  type JsonSchemaObject,
+} from "openclaw/plugin-sdk/json-schema-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import {
@@ -383,7 +386,6 @@ describe("validateProviderConfig", () => {
       config.skipSignatureVerification = true;
       expect(validateProviderConfig(config).errors).toContain("LiveKit requires signed webhooks");
     });
-
 
     it("accepts realtime.enabled with provider=telnyx", () => {
       const config = createBaseConfig("telnyx");
@@ -970,13 +972,17 @@ describe("LiveKit server transport", () => {
     inboundTrunkIds: ["ST_in"],
   };
   it("defaults to secure transport without an insecure opt-in", () => {
-    expect(normalizeVoiceCallConfig({ provider: "livekit", livekit }).livekit?.allowInsecureWs).toBe(false);
+    expect(
+      normalizeVoiceCallConfig({ provider: "livekit", livekit }).livekit?.allowInsecureWs,
+    ).toBe(false);
     expect(validateManifest(livekit)).toBe(true);
     expect(validateManifest({ ...livekit, url: "ws://10.0.0.1:7880" })).toBe(false);
-    expect(() => normalizeVoiceCallConfig({
+    expect(() =>
+      normalizeVoiceCallConfig({
         provider: "livekit",
         livekit: { ...livekit, url: "ws://10.0.0.1:7880" },
-      })).toThrow();
+      }),
+    ).toThrow();
   });
   it.each([
     "ws://10.0.0.1:7880",
@@ -989,10 +995,12 @@ describe("LiveKit server transport", () => {
     "ws://[fd12:3456::1]:7880",
   ])("allows explicit trusted-network opt-in for %s", (url) => {
     expect(validateManifest({ ...livekit, url, allowInsecureWs: true })).toBe(true);
-    expect(() => normalizeVoiceCallConfig({
+    expect(() =>
+      normalizeVoiceCallConfig({
         provider: "livekit",
         livekit: { ...livekit, url, allowInsecureWs: true },
-      })).not.toThrow();
+      }),
+    ).not.toThrow();
   });
   it.each([
     "ws://localhost:7880",
@@ -1017,9 +1025,11 @@ describe("LiveKit server transport", () => {
     "wss://livekit.example.test#token",
   ])("rejects unsafe URLs even with opt-in: %s", (url) => {
     expect(validateManifest({ ...livekit, url, allowInsecureWs: true })).toBe(false);
-    expect(() => normalizeVoiceCallConfig({
+    expect(() =>
+      normalizeVoiceCallConfig({
         provider: "livekit",
         livekit: { ...livekit, url, allowInsecureWs: true },
-      })).toThrow();
+      }),
+    ).toThrow();
   });
 });

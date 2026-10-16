@@ -14,7 +14,7 @@ import {
   REALTIME_MEDIA_INACTIVITY_TIMEOUT_MS,
   REALTIME_DISCONNECT_HANGUP_GRACE_MS,
 } from "./realtime-call-session-control.js";
-import type { RealtimeMediaTransport } from "./realtime-handler.js";
+import type { RealtimeMediaTransport } from "./realtime-call-transport.js";
 import { createRealtimeHostSpeechController } from "./realtime-host-speech.js";
 import type { StreamFrameAdapter } from "./stream-frame-adapter.js";
 

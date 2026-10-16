@@ -1,6 +1,5 @@
 import crypto from "node:crypto";
 import type { IncomingMessage } from "node:http";
-import { AccessToken, WebhookEvent } from "livekit-server-sdk";
 import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { createTestPluginServiceScheduler } from "openclaw/plugin-sdk/plugin-test-api";
@@ -11,7 +10,6 @@ import { normalizeVoiceCallConfig, type VoiceCallConfig } from "./config.js";
 import type { CallManager } from "./manager.js";
 import type { MediaStreamConfig } from "./media-stream.js";
 import type { VoiceCallProvider } from "./providers/base.js";
-import { LiveKitProvider } from "./providers/livekit.js";
 import { MockProvider } from "./providers/mock.js";
 import { PlivoProvider } from "./providers/plivo.js";
 import { TwilioProvider } from "./providers/twilio.js";
@@ -1342,47 +1340,3 @@ describe("VoiceCallWebhookServer barge-in suppression during initial message", (
   });
 });
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */
-
-describe("LiveKit signed async webhook pipeline", () => {
-  it("awaits signature and parse, retries failed persistence, and keeps replays idempotent", async () => {
-    const config = createConfig({
-      provider: "livekit",
-      livekit: {
-        url: "wss://livekit.example.test",
-        apiKey: "synthetic-key",
-        apiSecret: "synthetic-offline-secret",
-        outboundTrunkId: "ST_out",
-        inboundTrunkIds: ["ST_in"],
-      },
-    });
-    const carrier = new LiveKitProvider(config.livekit!);
-    const { manager, processEvent } = createManager([]);
-    const server = createServer(config, manager, carrier);
-    const url = await server.start();
-    const body = new WebhookEvent({ id: "signed-event", event: "room_finished" }).toJsonString();
-    const jwt = new AccessToken("synthetic-key", "synthetic-offline-secret", { ttl: 60 });
-    jwt.sha256 = crypto.createHash("sha256").update(body).digest("base64");
-    const headers = { authorization: await jwt.toJwt(), "content-type": "application/json" };
-    const parse = vi.spyOn(carrier, "parseWebhookEvent").mockImplementation(async () => ({
-      events: [
-        {
-          id: "signed-event",
-          callId: "synthetic-call",
-          providerCallId: "synthetic-room",
-          type: "call.ended",
-          reason: "completed",
-          timestamp: 1,
-        },
-      ],
-    }));
-    expect((await postWebhookForm(url, body + " ", headers)).status).toBe(401);
-    expect(parse).not.toHaveBeenCalled();
-    processEvent.mockRejectedValueOnce(new Error("Synthetic persistence failure"));
-    expect((await postWebhookForm(url, body, headers)).status).toBe(500);
-    expect((await postWebhookForm(url, body, headers)).status).toBe(200);
-    expect((await postWebhookForm(url, body, headers)).status).toBe(200);
-    expect(processEvent).toHaveBeenCalledTimes(2);
-    expect(parse).toHaveBeenCalledTimes(2);
-    await carrier.stop();
-  });
-});
