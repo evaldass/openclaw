@@ -56,6 +56,7 @@ vi.mock("./config.js", async (importOriginal) => {
   };
 });
 
+// mock-isolation: Runtime construction uses a lifecycle-only carrier test double.
 vi.mock("./providers/livekit.js", () => ({
   LiveKitProvider: class {
     name = "livekit";

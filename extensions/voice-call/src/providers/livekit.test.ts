@@ -32,8 +32,7 @@ import {
 } from "../webhook/realtime-handler.lifecycle.test-helpers.js";
 import { LiveKitProvider, type LiveKitDependencies } from "./livekit.js";
 
-// Offline state boundary: exercise the real manager admission/identity owner without
-// requiring a host SQLite broker inside Vitest's application worker.
+// mock-isolation: The offline manager/identity fixture must not open the host SQLite broker.
 vi.mock("../manager/store.js", () => {
   const records = new Map<string, Map<string, CallRecord>>();
   const store = (path: string) => {

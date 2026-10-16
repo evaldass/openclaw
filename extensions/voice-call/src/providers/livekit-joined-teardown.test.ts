@@ -543,7 +543,7 @@ it.each(["ttl", "capacity"] as const)(
       await original(...args);
     });
     const first = h.webhook("room_finished").catch((error: unknown) => error);
-    let clock: ReturnType<typeof vi.spyOn> | undefined;
+    let clock: { mockRestore: () => void } | undefined;
     try {
       await h.closeEntered.promise;
       h.finishClose.resolve();
