@@ -17,6 +17,7 @@ import {
 import { resolveRuntimeProcessEntrypointUrl } from "../runtime-process-url.js";
 import { resolveRuntimeWorkerThreadExecArgv } from "../runtime-worker-url.js";
 import type { PostgresSqlConnection, SqlStatement } from "../sql-connection.js";
+import { sqlPublicationAnchor } from "../sql-connection.js";
 import {
   beginSqliteDatabaseWrite,
   finishSqliteDatabaseWrite,
@@ -25,6 +26,7 @@ import { withSqlitePostCommitPublications } from "../sqlite-post-commit.js";
 import { SqliteWorkerError } from "../sqlite-worker-contract.js";
 import { deferSqliteWorkerCommitReceipt } from "../sqlite-worker-operation-admission.js";
 import { currentSqliteWorkerOperationAdmission } from "../sqlite-worker-operation-settlement.js";
+import { recordWorkerMessage } from "../worker-message-metrics.js";
 import {
   decodePostgresError,
   decodePostgresRows,
@@ -33,12 +35,14 @@ import {
   validatePostgresBindings,
   type BridgeReply,
   type BridgeCommand,
+  type PostgresResult,
 } from "./protocol.js";
 import { runPostgresTransactionSync } from "./transaction.js";
 
 export class PostgresSyncConnection implements PostgresSqlConnection {
   isOpen = true;
   isTransaction = false;
+  mutationRevision = 0;
   readonly advisoryLockKey: bigint;
   private readonly port: MessagePort;
   private readonly control = new Int32Array(new SharedArrayBuffer(8));
@@ -52,7 +56,7 @@ export class PostgresSyncConnection implements PostgresSqlConnection {
     url: string,
     readonly schema: string,
     readonly anchor: DatabaseSync,
-    storeId: string,
+    readonly storeId: string,
     options?: {
       lockTimeoutMs?: number;
       statementTimeoutMs?: number;
@@ -98,11 +102,15 @@ export class PostgresSyncConnection implements PostgresSqlConnection {
     return runPostgresTransactionSync(this, operation, options, ...modes);
   }
 
+  readRecoveryGeneration(lock = false): string {
+    return this.request({ operation: "recovery-generation", storeId: this.storeId, lock }, false);
+  }
+
   private loseConnection(): Error {
     if (!this.failure && this.outcomeUnknown) {
       // The write may have committed, so invalidate anchor caches before reconnecting.
-      beginSqliteDatabaseWrite(this.anchor);
-      finishSqliteDatabaseWrite(this.anchor);
+      beginSqliteDatabaseWrite(sqlPublicationAnchor(this));
+      finishSqliteDatabaseWrite(sqlPublicationAnchor(this));
     }
     this.failure ??= this.outcomeUnknown
       ? new SqliteWorkerError("PostgreSQL connection lost; outcome unknown", "outcome-unknown")
@@ -123,7 +131,15 @@ export class PostgresSyncConnection implements PostgresSqlConnection {
     }
   }
 
-  private request(request: BridgeCommand, outcomeUnknown = true) {
+  private request(
+    request: Extract<BridgeCommand, { operation: "recovery-generation" }>,
+    outcomeUnknown?: boolean,
+  ): string;
+  private request(
+    request: Exclude<BridgeCommand, { operation: "recovery-generation" }>,
+    outcomeUnknown?: boolean,
+  ): PostgresResult;
+  private request(request: BridgeCommand, outcomeUnknown = true): PostgresResult | string {
     if (this.mainThread && request.operation !== "close") {
       assertEngineStoreExecutionAllowed();
     }
@@ -135,6 +151,7 @@ export class PostgresSyncConnection implements PostgresSqlConnection {
     }
     const deadline = performance.now() + 120_000;
     this.port.postMessage({ ...request, id }, []);
+    recordWorkerMessage("sqlite_request", "to_worker");
     // A notify for an earlier request can arrive after this request starts.
     let observed: number;
     while ((observed = Atomics.load(this.control, 0)) !== id) {
@@ -145,6 +162,9 @@ export class PostgresSyncConnection implements PostgresSqlConnection {
       Atomics.wait(this.control, 0, observed, remaining);
     }
     const reply: BridgeReply | undefined = receiveMessageOnPort(this.port)?.message;
+    if (reply) {
+      recordWorkerMessage("sqlite_reply", "from_worker");
+    }
     if (!reply || reply.id !== id) {
       throw this.loseConnection();
     }
@@ -160,7 +180,7 @@ export class PostgresSyncConnection implements PostgresSqlConnection {
       }
       throw decodePostgresError(reply.error);
     }
-    return reply.result;
+    return "generation" in reply ? reply.generation : reply.result;
   }
 
   query(sql: string, parameters: readonly SQLInputValue[] = [], readBigInts = false) {
@@ -188,18 +208,22 @@ export class PostgresSyncConnection implements PostgresSqlConnection {
         throw new Error("PostgreSQL transaction rolled back instead of committing");
       }
     }
-    const autocommitWrite =
-      !wasTransaction &&
+    const mutated =
       /^(?:INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|DROP|TRUNCATE|COMMENT|GRANT|REVOKE)$/.test(
         result.command ?? "",
       );
+    if (mutated) {
+      // Like SQLite's mutation witness, rollback does not rewind local cache invalidation.
+      this.mutationRevision++;
+    }
+    const autocommitWrite = !wasTransaction && mutated;
     if (result.command === "COMMIT" || autocommitWrite) {
       // All confirmed commits advance the anchor, including callers using raw SQL.
-      withSqlitePostCommitPublications(this.anchor, () => {
-        beginSqliteDatabaseWrite(this.anchor);
-        finishSqliteDatabaseWrite(this.anchor);
+      withSqlitePostCommitPublications(sqlPublicationAnchor(this), () => {
+        beginSqliteDatabaseWrite(sqlPublicationAnchor(this));
+        finishSqliteDatabaseWrite(sqlPublicationAnchor(this));
         if (autocommitWrite && currentSqliteWorkerOperationAdmission.getStore()?.active) {
-          deferSqliteWorkerCommitReceipt(this.anchor, {});
+          deferSqliteWorkerCommitReceipt(sqlPublicationAnchor(this), {});
         }
       });
     }

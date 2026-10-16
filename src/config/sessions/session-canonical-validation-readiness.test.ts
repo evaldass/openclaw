@@ -18,6 +18,7 @@ import {
 } from "../../state/openclaw-agent-db-validation-cache.js";
 import { openOpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
 import { runOpenClawAgentWriteAdmission } from "../../state/openclaw-agent-write-admission.js";
+import { requireNativeSqliteDatabase } from "../../test-utils/native-sqlite.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { sessionNativeProcessEntrypoints } from "./native-process-runtime.test-support.js";
 import * as archiveWorker from "./session-accessor.sqlite-archive.js";
@@ -63,7 +64,7 @@ it("refuses replacement schema drift before reusing a warm canonical readiness r
     expect(hasPendingCanonicalSessionValidation(database)).toBe(false);
     await certifySessionCanonicalValidationPending(options);
     const replacement = `${database.path}.replacement`;
-    await backup(database.db, replacement);
+    await backup(requireNativeSqliteDatabase(database.db), replacement);
     await closeOpenClawAgentDatabaseByPathAsync(database.path);
     const peer = new DatabaseSync(replacement);
     try {
@@ -155,9 +156,13 @@ it.each(["unchanged", "pending edit", "replacement", "revoked", "unregistered"] 
         { env: { ...process.env, ...state.env }, encoding: "utf8", timeout: 30_000 },
       );
       expect(result.status, result.stderr).toBe(0);
+      // Pending canonical rows retain integrity proof; replacement or revocation loses only main's.
       expect(JSON.parse(result.stdout)).toEqual({
         workers: change === "unchanged" ? 0 : 1,
-        integrityReceipts: 0,
+        integrityReceipts:
+          change === "unchanged" || change === "pending edit"
+            ? agentIds.length
+            : agentIds.length - 1,
       });
     });
   },

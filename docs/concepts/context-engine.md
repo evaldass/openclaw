@@ -240,21 +240,27 @@ Required members:
 
 Set `info.acceptedHostParams` to restrict the host-added lifecycle fields the
 engine receives. Current keys are `sessionKey`, `prompt`, `runtimeSettings`,
-`sessionTarget`, `runtimeContext`, and `abortSignal`. OpenClaw intersects the
-declaration with the fields available for each lifecycle method, so undeclared
-or unknown keys are never injected. `abortSignal` governs optional cooperative
-cancellation for `maintain()`; the existing compact-operation abort signal is
-always preserved. Engines without this declaration receive every current host
-field; declare an explicit list, including `[]`, when the engine validates a
-narrower input shape.
+`sessionTarget`, `runtimeContext`, `abortSignal`, and `onProgress`. OpenClaw
+intersects the declaration with the fields available for each lifecycle method,
+so undeclared or unknown keys are never injected. `abortSignal` governs optional
+cooperative cancellation for `maintain()`; the existing compact-operation abort
+signal is always preserved. Engines without this declaration receive every
+current host field except `onProgress`; declare an explicit list, including `[]`,
+when the engine validates a narrower input shape.
+
+Compaction progress is opt-in: explicitly include `"onProgress"` to receive the
+optional `compact()` callback. Report useful progress to refresh the existing
+no-progress window, under the same finite overall ceiling. Engines that omit the
+declaration or exclude `"onProgress"` keep the one-window contract for their own
+compaction work. See [Compaction progress](/plugins/architecture-internals/context-engines#compaction-progress).
 
 For durable admitted turns, declare both transcript semantics:
 
 - `currentTurnFence: "before-current-turn-entry-v1"`
 - `turnAdvancementIdempotency: "atomic-idempotent-v1"`
 
-and implement `commitTurn(...)` as one atomic, idempotent write keyed by
-`advancementKey`. Return `{ status: "committed" }` for the first write and
+and implement `commitTurn(...)` as one atomic write keyed by
+`advancementKey` that has no additional effect when repeated. Return `{ status: "committed" }` for the first write and
 `{ status: "duplicate" }` when a host retry presents an already-committed key.
 The `messages` payload contains only the inclusive range from the admitted user
 entry through the accepted terminal entry. Engines that need the earlier
@@ -386,7 +392,7 @@ host parameters and accept `runtimeSettings` must include it in
 ### Host requirements
 
 Context engines can declare host capability requirements on `info.hostRequirements`.
-OpenClaw checks these requirements before starting the operation and fails closed
+OpenClaw checks these requirements before starting the operation and stops
 with a descriptive error when the selected runtime cannot satisfy them.
 
 For agent runs, declare `assemble-before-prompt` when the engine must control the
@@ -427,7 +433,7 @@ cleanup owns an independent async lifetime, so a closed caller scope does not
 prevent its factory from running.
 
 Host requirement failures are different: when an engine declares that a runtime
-lacks a required capability, OpenClaw fails closed before starting the run. That
+lacks a required capability, OpenClaw refuses to start the run. That
 protects engines that would corrupt state if they ran in an unsupported host.
 
 ### ownsCompaction

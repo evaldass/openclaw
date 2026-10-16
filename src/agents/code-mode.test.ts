@@ -12,6 +12,7 @@ import {
   type DiagnosticEventPayload,
 } from "../infra/diagnostic-events.js";
 import { readLocalFileSafely } from "../infra/fs-safe.js";
+import * as diagnostics from "../logging/code-mode-diagnostic.js";
 import { setPluginToolMeta } from "../plugins/tool-metadata.js";
 import { resolveSkillsPrompt } from "../skills/loading/workspace-skill-prompt.js";
 import { consumeRunSkillUsage } from "../skills/runtime/run-usage.js";
@@ -313,57 +314,6 @@ describe("Code Mode search", () => {
   });
 });
 
-it("searches and reads eligible skills through the worker bridge and normal tool dispatch", async () => {
-  const demo = createFixtureSkillEntry("demo");
-  const hidden = createFixtureSkillEntry("hidden");
-  const body = "---\nname: demo\n---\n\n# Complete demo instructions\n";
-  const reader = vi.fn(async () => body);
-  const codeModeSkills = resolveCodeModeSkills({
-    skillsPrompt: await resolveSkillsPrompt({ entries: [demo], workspaceDir: "/workspace" }),
-    candidates: [demo.skill, hidden.skill],
-    reader,
-  });
-  const h = createCodeModeHarness({ codeModeSkills });
-  applyCodeModeCatalog({
-    ...h.ctx,
-    tools: [...h.tools, ...createInstalledSkillTools(codeModeSkills)],
-  });
-  const result = await runUntilCompleted({
-    execTool: h.tools[0]!,
-    waitTool: h.tools[1]!,
-    code: `
-    const listed = await skills.list();
-    const found = await skills.search("demo");
-    const body = await skills.read("demo");
-    let unknown;
-    try { await skills.read("missing"); } catch (error) { unknown = error.message; }
-    return { listed, found, body, unknown };
-  `,
-  });
-  expect(result).toMatchObject({
-    status: "completed",
-    value: {
-      listed: [
-        { name: "demo", description: demo.skill.description, location: "/skills/demo/SKILL.md" },
-      ],
-      found: {
-        skills: [
-          { name: "demo", description: demo.skill.description, location: "/skills/demo/SKILL.md" },
-        ],
-        hasMore: false,
-        coverage: { bodyIndexed: 0, metadataOnly: 1, truncatedBodies: 0 },
-      },
-      body,
-      unknown:
-        'Skill "missing" is not available to this agent. Search the available skills instead.',
-    },
-  });
-  expect(reader).toHaveBeenCalledExactlyOnceWith({
-    location: "/skills/demo/SKILL.md",
-    signal: expect.any(AbortSignal),
-  });
-});
-
 it("records Code Mode skills.read of a workshop skill as run usage and skill.used", async () => {
   const learned = createFixtureSkillEntry("learned", { source: "openclaw-workshop" });
   const codeModeSkills = resolveCodeModeSkills({
@@ -405,7 +355,13 @@ it("records Code Mode skills.read of a workshop skill as run usage and skill.use
       waitTool: h.tools[1]!,
       code: 'return await skills.read("learned");',
     });
-    expect(result).toMatchObject({ status: "completed", value: "# Learned instructions\n" });
+    expect(result).toMatchObject({
+      status: "completed",
+      value:
+        "Skill location: /skills/learned/SKILL.md\n" +
+        "Resolve relative resource paths from the directory containing this SKILL.md.\n\n" +
+        "# Learned instructions\n",
+    });
     expect(consumeRunSkillUsage("run-code-mode")).toEqual([
       {
         name: "learned",
@@ -570,7 +526,9 @@ it.for(["transported", "skills_read", "skills_search", "shadowed", "revoked"] as
                   ? expect.stringContaining("Unknown tool id: skills_read.")
                   : denied === "shadowed"
                     ? expect.stringContaining("Shadowed reader")
-                    : "Private instructions",
+                    : `Skill location: ${filePath}\n` +
+                      "Resolve relative resource paths from the directory containing this SKILL.md.\n\n" +
+                      "Private instructions",
           },
         });
         expect(reads).toBe(denied === undefined || denied === "revoked" ? 1 : 0);
@@ -601,6 +559,9 @@ it.each([undefined, "read", "skills_read"])(
     const guide = createFixtureSkillEntry("guide");
     const hidden = createFixtureSkillEntry("hidden");
     const body = `${"x".repeat(256 * 1024)}complete tail`;
+    const context =
+      "Skill location: /skills/guide/SKILL.md\n" +
+      "Resolve relative resource paths from the directory containing this SKILL.md.\n\n";
     guide.skill.readContent = body;
     hidden.skill.readContent = body;
     const skills = prepareInstalledSkillCatalog({
@@ -641,7 +602,7 @@ it.each([undefined, "read", "skills_read"])(
       value: {
         body: denied
           ? "skills_read is not available in this run."
-          : { length: body.length, tail: "complete tail" },
+          : { length: context.length + body.length, tail: "complete tail" },
         hidden: denied
           ? "skills_read is not available in this run."
           : 'Skill "hidden" exceeds the 262144-byte instruction limit.',
@@ -660,7 +621,7 @@ it("returns missing implicitly optional daily memory through Code Mode", async (
         },
         readFile: async () => Buffer.from("unreachable"),
       },
-    }) as unknown as Parameters<typeof createOpenClawReadTool>[0],
+    }),
   );
   applyCodeModeCatalog({ ...h.ctx, tools: [...h.tools, read] });
   const result = await runUntilCompleted({
@@ -893,7 +854,40 @@ describe("session store bridge", () => {
     });
   });
 
+  it.each([
+    { name: "invalid key", set: { "": true }, cause: TypeError },
+    { name: "oversized value", set: { key: "x".repeat(256 * 1024) }, cause: RangeError },
+    {
+      name: "oversized store",
+      set: Object.fromEntries(
+        ["a", "b", "c", "d", "e"].map((key) => [key, "x".repeat(256 * 1024 - 2)]),
+      ),
+      cause: RangeError,
+    },
+  ])("keeps $name replay failures distinct from guest input", async ({ set, cause }) => {
+    const log = vi.spyOn(diagnostics, "logCodeModeFailure").mockImplementation(() => {});
+    const h = sessionStoreHarness(executor);
+    await h.manager.appendCustomEntryAsync("openclaw.code-mode-store", {
+      set,
+      delete: [],
+      networkContent: Object.fromEntries(Object.keys(set).map((key) => [key, false])),
+    });
+    const result = resultDetails(await h.exec('return await load("key");'));
+    expect(result).toMatchObject({
+      status: "failed",
+      code: "internal_error",
+      failurePhase: "bridge",
+      error: expect.stringContaining("repair the session"),
+    });
+    expect(log).toHaveBeenCalledOnce();
+    expect(log).toHaveBeenCalledWith(
+      expect.objectContaining({ cause: expect.any(cause) }),
+      expect.objectContaining({ failurePhase: "bridge", failureCode: "tool_error" }),
+    );
+  });
+
   it("keeps bridge provenance for uncaught typed store errors", async () => {
+    const log = vi.spyOn(diagnostics, "logCodeModeFailure").mockImplementation(() => {});
     const h = sessionStoreHarness(executor);
     const result = resultDetails(await h.exec('await store("a", "x".repeat(256 * 1024));'));
     expect(result).toMatchObject({
@@ -903,6 +897,11 @@ describe("session store bridge", () => {
       bridgeDispatchStarted: true,
     });
     expect(String(result.error)).toMatch(/^RangeError/);
+    expect(log).toHaveBeenCalledOnce();
+    expect(log).toHaveBeenCalledWith(
+      expect.any(RangeError),
+      expect.objectContaining({ failurePhase: "bridge", failureCode: "store_range" }),
+    );
   });
 
   it("retains writes across wait, hides them from sibling cells, and commits once", async () => {

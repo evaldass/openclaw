@@ -7,14 +7,14 @@ import {
   CodexAppServerUnsafeSubscriptionError,
   unsubscribeCodexThreadBestEffort,
 } from "./attempt-client-cleanup.js";
-import { resolveCodexAppServerLocalHomeDir } from "./auth-start-options.js";
+import {
+  resolveCodexAppServerLocalHomeDir,
+  usesManagedCodexThreadUnloading,
+} from "./auth-start-options.js";
+import { recordCodexThreadForkSettings } from "./client-fork-settings.js";
 import { hasCodexAppServerSiblingThreadWork } from "./client-runtime.js";
 import { createCodexEphemeralThreadPolicy } from "./client-thread-owner.js";
-import {
-  CodexAppServerRpcError,
-  isCodexAppServerOverloadError,
-  resolveCodexAppServerClientInstanceId,
-} from "./client.js";
+import { CodexAppServerRpcError, isCodexAppServerOverloadError } from "./client.js";
 import { buildCodexAppServerConnectionFingerprint } from "./plugin-app-cache-key.js";
 import {
   attestCodexThreadToolSurface,
@@ -54,11 +54,16 @@ import type {
 import { resolveCodexAppServerModelProvider } from "./thread-model-selection.js";
 import { CodexThreadPolicyHandoffError, refreshCodexThreadPolicy } from "./thread-policy.js";
 import { buildThreadStartParams } from "./thread-requests.js";
+import {
+  buildRestrictedThreadConfigFingerprint,
+  isRestrictedThreadConfigCompatible,
+} from "./thread-restricted-resume.js";
 import { resumeCodexAppServerThread } from "./thread-resume.js";
 import { hasCodexAppServerSiblingRouteWork } from "./turn-router.js";
 
-type CodexResumeThreadContext = CodexThreadRequestContext & {
+export type CodexResumeThreadContext = CodexThreadRequestContext & {
   binding: CodexAppServerThreadBinding;
+  requireRestrictedThreadConfigFingerprint?: boolean;
   stageBindingReplacement: (operation: string) => void;
   prebuiltPluginThreadConfig?: CodexPluginThreadConfig;
   buildLoadedPluginThreadConfig?: (
@@ -69,7 +74,7 @@ type CodexResumeThreadContext = CodexThreadRequestContext & {
   releaseRetainedThread: (assertCurrent: () => void) => Promise<void>;
 };
 
-type CodexStartThreadContext = CodexThreadRequestContext & {
+export type CodexStartThreadContext = CodexThreadRequestContext & {
   prebuiltPluginThreadConfig?: CodexPluginThreadConfig;
   preserveExistingBinding: boolean;
   rotatedContextEngineBinding: boolean;
@@ -138,9 +143,12 @@ export async function resumeExistingCodexThread(
       resumeBinding.ringZeroClientInstanceId !== undefined ||
       resumeBinding.ringZeroConfigFingerprint !== undefined ||
       context.ringZeroActive;
+    const managedThreadUnloading = usesManagedCodexThreadUnloading(params.appServer.start);
+    const threadUnloaded = managedThreadUnloading && (await configuration.waitForUnload());
     const sharedEntry = getCurrentSharedClientEntry(params.client);
     if (
       configuration.settledSystemError &&
+      !threadUnloaded &&
       !clientBoundThread &&
       resumeBinding.connectionScope !== "supervision" &&
       // This attempt owns one lease. Other leases and pending startups can
@@ -153,6 +161,11 @@ export async function resumeExistingCodexThread(
       // retirement, so only an otherwise inactive client can recover this way.
       await abandonClient();
       throw new CodexThreadClientReplacementError();
+    }
+    // A timed-out managed teardown must preserve history, never rotate a closing thread.
+    // External servers keep their native idle-thread reload path during resume.
+    if (managedThreadUnloading) {
+      configuration.assertConfigured();
     }
     const authProfileId =
       resumeBinding.connectionScope === "supervision"
@@ -183,6 +196,10 @@ export async function resumeExistingCodexThread(
     const resumeParams = await lifecycleTiming.measure("thread-resume-params", () =>
       context.buildResumeParams(resumeBinding, authProfileId, resumeConfig),
     );
+    if (!isRestrictedThreadConfigCompatible(params, context, resumeParams, authProfileId)) {
+      stageBindingReplacement("rotating changed restricted thread configuration");
+      return undefined;
+    }
     const requestModelProvider =
       typeof resumeParams.modelProvider === "string" && resumeParams.modelProvider.trim()
         ? resumeParams.modelProvider
@@ -213,6 +230,7 @@ export async function resumeExistingCodexThread(
       }),
     );
     acceptedConfiguration = configuration;
+    recordCodexThreadForkSettings(params.client, resumeBinding.threadId, resumeParams);
     assertCodexThreadAcceptsDirectInput(response.thread);
     configuration.assertConfigured();
     if (requestModelProvider && response.modelProvider !== requestModelProvider) {
@@ -261,7 +279,7 @@ export async function resumeExistingCodexThread(
     const resumePatch = {
       // Resume moves native subscription ownership to this physical client.
       // Keeping its previous client id disables warm reuse after every restart.
-      clientId: resolveCodexAppServerClientInstanceId(params.client),
+      clientId: params.client.getInstanceId(),
       pendingResumeConfiguration: undefined,
       ...(resumeBinding.agentWorkspaceDeveloperInstructions === undefined &&
       params.agentWorkspaceDeveloperInstructions !== undefined
@@ -286,6 +304,9 @@ export async function resumeExistingCodexThread(
       ringZeroConfigFingerprint,
       ringZeroClientInstanceId,
       nativeToolPolicyRestricted: restrictedToolSurface ? true : undefined,
+      restrictedThreadConfigFingerprint: context.requireRestrictedThreadConfigFingerprint
+        ? resumeBinding.restrictedThreadConfigFingerprint
+        : undefined,
       nativeHookRelayGeneration:
         finalConfigPatch.nativeHookRelayGeneration ?? resumeBinding.nativeHookRelayGeneration,
       appServerRuntimeFingerprint:
@@ -417,7 +438,7 @@ export async function startFreshCodexThread(
   params: CodexStartOrResumeThreadParams,
   context: CodexStartThreadContext,
 ): Promise<CodexAppServerThreadLifecycleBinding> {
-  const clientId = resolveCodexAppServerClientInstanceId(params.client);
+  const clientId = params.client.getInstanceId();
   const {
     bindingIdentity,
     startModelSelection,
@@ -497,6 +518,7 @@ export async function startFreshCodexThread(
     }
   });
   const response = assertCodexThreadStartResponse(threadStartResponse);
+  recordCodexThreadForkSettings(params.client, response.thread.id, startParams);
   const provisionalAppIds = pluginThreadConfig?.provisionalAppIds;
   const rejectUncommittedThread = async (cause: unknown): Promise<never> => {
     const cleanupConfirmed = await discardUnattestedCodexPluginThread({
@@ -545,6 +567,12 @@ export async function startFreshCodexThread(
   );
   const nextMcpServersFingerprint =
     params.mcpServersFingerprintEvaluated === true ? params.mcpServersFingerprint : undefined;
+  const restrictedThreadConfigFingerprint = buildRestrictedThreadConfigFingerprint(
+    params,
+    context,
+    startParams,
+    { model: response.model, modelProvider: bindingModelProvider ?? null },
+  );
   const startedBinding: CodexAppServerThreadBinding = {
     threadId: response.thread.id,
     ...(clientId ? { clientId } : {}),
@@ -555,6 +583,7 @@ export async function startFreshCodexThread(
     model: response.model ?? startParams.model ?? params.params.modelId,
     modelProvider: bindingModelProvider,
     ...buildCodexThreadBindingPolicy(params, context),
+    restrictedThreadConfigFingerprint,
     mcpServersFingerprint: nextMcpServersFingerprint,
     ringZeroConfigFingerprint,
     ringZeroClientInstanceId,
@@ -625,7 +654,10 @@ export async function startFreshCodexThread(
       response.modelProvider ?? requestModelProvider ?? startModelProvider ?? modelProvider,
     // Restricted ephemeral threads also need creation policy for fenced warm reuse.
     liveThreadEphemeralPolicy: startParams.ephemeral
-      ? createCodexEphemeralThreadPolicy(params)
+      ? createCodexEphemeralThreadPolicy(
+          { ...params, config: startParams.config },
+          context.effectiveConfig.config,
+        )
       : undefined,
     // Transient starts do not own the persisted binding, so their native
     // subscriptions must be released instead of entering the warm cache.

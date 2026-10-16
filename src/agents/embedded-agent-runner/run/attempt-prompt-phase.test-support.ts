@@ -228,6 +228,7 @@ export function createFixture({ pendingPrompt = "hello", pendingImageCount = 1 }
       withOwnedTranscriptWrite: async <T>(operation: () => Promise<T> | T) => await operation(),
     },
     setup: {
+      prepStages: { mark: vi.fn() },
       effectiveFsWorkspaceOnly: false,
       effectiveWorkspace: "/tmp/workspace",
       sandbox: null,
@@ -290,9 +291,8 @@ export function createFixture({ pendingPrompt = "hello", pendingImageCount = 1 }
           Object.assign(this.current, mocks.applyPromptToolsAllow({ toolsAllow }));
           return this.current;
         },
-        readDecisionBaseline: () => undefined,
+        hasBaselineTools: () => true,
         prepareForDispatch: () => undefined,
-        decisionRequiredNames: [],
         refresh() {
           return this.current;
         },

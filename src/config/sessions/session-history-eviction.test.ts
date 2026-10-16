@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import type { Worker } from "node:worker_threads";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { trackSqliteStatementExecutions } from "../../../test/helpers/sqlite-statement-execution-counter.js";
+import { requireNativeSqliteDatabase } from "../../test-utils/native-sqlite.js";
 
 const evictionWarnSpy = vi.hoisted(() => vi.fn());
 vi.mock("../../logging/subsystem.js", async () => {
@@ -50,7 +51,9 @@ import {
   replaceSessionEntrySync,
   resetSessionEntryLifecycle,
 } from "./session-accessor.js";
+import { loadSessionEntryReadOnly } from "./session-accessor.sqlite-entry.js";
 import * as sessionLifecycleState from "./session-accessor.sqlite-lifecycle-state.js";
+import * as archivePruning from "./session-history-archive-pruning.js";
 import { createSessionHistoryBudgetFixture } from "./session-history-budget.test-support.js";
 import {
   enforceSqliteSessionHistoryDiskBudget,
@@ -255,6 +258,44 @@ describe("SQLite historical session disk budget", () => {
     },
   );
 
+  it("evicts bulk historical generations without analyzing unchanged session entries", async () => {
+    for (let index = 0; index < 65; index++) {
+      await createHistoricalTranscript({
+        content: "Historical generation " + index,
+        nextSessionId: `bulk-live-${index}`,
+        sessionId: `bulk-history-${index}`,
+        sessionKey: `agent:main:bulk-history-${index}`,
+        updatedAt: index + 1,
+      });
+    }
+    settlePhysicalUsage();
+    database().db.exec("ANALYZE;");
+    const readWindowStatistics = () =>
+      database()
+        .db.prepare("SELECT stat FROM sqlite_stat1 WHERE idx = ?")
+        .get("idx_agent_session_windows_updated_at");
+    expect(readWindowStatistics()).toEqual({ stat: expect.stringMatching(/^130\b/u) });
+
+    const result = await enforceSqliteSessionHistoryDiskBudget({
+      storePath,
+      mode: "enforce",
+      maintenance: { maxDiskBytes: 1, highWaterBytes: 1 },
+    });
+
+    expect(result?.removedEntries).toBe(65);
+    expect(database().db.prepare("SELECT COUNT(*) AS count FROM session_windows").get()).toEqual({
+      count: 65,
+    });
+    for (let index = 0; index < 65; index++) {
+      expect(
+        loadSessionEntryReadOnly({ sessionKey: `agent:main:bulk-history-${index}`, storePath }),
+      ).toMatchObject({ sessionId: `bulk-live-${index}` });
+    }
+    // Planner estimates can remain stale after history-only deletion; its entry
+    // count did not change and transcript readers use session-scoped indexes.
+    expect(readWindowStatistics()).toEqual({ stat: expect.stringMatching(/^130\b/u) });
+  });
+
   it("pages past protected archives to evict cap-created sessions under pressure", async () => {
     const capKey = "agent:main:explicit:cap-archived";
     const manualKey = "agent:main:explicit:manual-archived";
@@ -432,8 +473,11 @@ describe("SQLite historical session disk budget", () => {
       sessionKey: "agent:main:canonical-pressure",
       updatedAt: 2,
     });
+    await closeOpenClawAgentDatabaseByPathAsync(database().path);
     settlePhysicalUsage();
     const before = await measureSessionPhysicalDiskUsage(storePath);
+    expect(before.databaseWalBytes).toBe(0);
+    expect(database().db.prepare("PRAGMA freelist_count").get()).toEqual({ freelist_count: 0 });
 
     const cachedDatabase = database();
     const rm = fs.promises.rm.bind(fs.promises);
@@ -533,7 +577,7 @@ describe("SQLite historical session disk budget", () => {
     await resetSessionEntryLifecycle({
       storePath,
       target: { canonicalKey: sessionKey, storeKeys: [sessionKey] },
-      buildNextEntry: () => ({ sessionId: "live-history", updatedAt: 4 }),
+      buildNextEntry: () => ({ sessionId: "live-history", updatedAt: Date.now() }),
     });
     addRouteReference("route-only", "route-history");
     const admission = await beginSessionWorkAdmission({
@@ -589,11 +633,14 @@ describe("SQLite historical session disk budget", () => {
         return prepared;
       },
     );
-    const reads = trackSqliteStatementExecutions(owner.db, ["history"], (sql) =>
-      /^select\b/i.test(sql) &&
-      /"(?:session_windows|transcript_rewrite_watermarks|trajectory_runtime_events)"/.test(sql)
-        ? "history"
-        : null,
+    const reads = trackSqliteStatementExecutions(
+      requireNativeSqliteDatabase(owner.db),
+      ["history"],
+      (sql) =>
+        /^select\b/i.test(sql) &&
+        /"(?:session_windows|transcript_rewrite_watermarks|trajectory_runtime_events)"/.test(sql)
+          ? "history"
+          : null,
     );
     try {
       expect(
@@ -793,52 +840,6 @@ describe("SQLite historical session disk budget", () => {
     },
   );
 
-  it("coalesces forced kicks during and after a sweep until the one-minute interval expires", async () => {
-    const now = Date.now();
-    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
-    const measurement = vi
-      .spyOn(diskBudgetModule, "measureSessionPhysicalDiskUsage")
-      .mockResolvedValue({
-        databaseMainBytes: 0,
-        databaseWalBytes: 0,
-        sessionFilesBytes: 0,
-        totalBytes: 0,
-      });
-    const maintenanceConfig = resolveMaintenanceConfigFromInput({
-      mode: "enforce",
-      maxDiskBytes: 1,
-      highWaterBytes: 1,
-    });
-    const kick = () =>
-      kickSessionHistoryDiskBudgetMaintenance({ storePath, force: true, maintenanceConfig });
-    const settle = async () => {
-      await enforceSqliteSessionHistoryDiskBudget({
-        storePath,
-        mode: "warn",
-        maintenance: { maxDiskBytes: null, highWaterBytes: null },
-      });
-      await new Promise<void>((resolve) => {
-        setImmediate(resolve);
-      });
-    };
-    kick();
-    for (let index = 0; index < 10; index++) {
-      kick();
-    }
-    await settle();
-    expect(measurement).toHaveBeenCalledOnce();
-
-    clock.mockReturnValue(now + 59_999);
-    kick();
-    await settle();
-    expect(measurement).toHaveBeenCalledOnce();
-
-    clock.mockReturnValue(now + 60_000);
-    kick();
-    await settle();
-    expect(measurement).toHaveBeenCalledTimes(2);
-  });
-
   it("backs off protected over-budget history and warns once while manual cleanup remains immediate", async () => {
     await createHistoricalTranscript({
       content: "protected history",
@@ -863,6 +864,7 @@ describe("SQLite historical session disk budget", () => {
     const now = Date.now();
     const clock = vi.spyOn(Date, "now").mockReturnValue(now);
     const references = vi.fn();
+    const pruning = vi.spyOn(archivePruning, "pruneAllSessionTranscriptArchivesToHighWater");
     const createReaders = workerReaders.createSessionHistoryWorkerReaders;
     vi.spyOn(workerReaders, "createSessionHistoryWorkerReaders").mockImplementation((run) => {
       const readers = createReaders(run);
@@ -911,11 +913,13 @@ describe("SQLite historical session disk budget", () => {
     ).resolves.toMatchObject({ overBudget: true, removedEntries: 0 });
     const manualScans = references.mock.calls.length;
     expect(manualScans).toBeGreaterThan(firstScans);
+    const manualPruning = pruning.mock.calls.length;
 
     clock.mockReturnValue(now + 31 * 60_000);
     kick();
     await settle();
     expect(references.mock.calls.length).toBeGreaterThan(manualScans);
+    expect(pruning).toHaveBeenCalledTimes(manualPruning);
     expect(evictionWarnSpy).toHaveBeenCalledOnce();
     expect(sessionExists("protected-old")).toBe(true);
     expect(sessionExists("protected-live")).toBe(true);

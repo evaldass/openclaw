@@ -44,6 +44,7 @@ import {
   type OpenAICompletionsContentDelta as CompletionsReasoningDelta,
   type OpenAICompletionsTextSource,
   type OpenAIModeModel,
+  detachPartialSnapshot,
 } from "./openai-transport-shared.js";
 import type { RecoveredTextToolCall, TextToolCallRecoveryPart } from "./text-tool-call-recovery.js";
 import { iterateModelStream, throwIfModelStreamAborted } from "./transport-stream-shared.js";
@@ -177,7 +178,7 @@ export async function processCompletionsStream(
   let chunkPushedEvent = false;
   const pushStreamEvent = (event: AssistantMessageEvent) => {
     chunkPushedEvent = true;
-    stream.push(event);
+    stream.push(detachPartialSnapshot(event));
   };
   const appendToolCallBlock = (block: ToolCallBlock) => {
     output.content.push(block);
@@ -436,6 +437,15 @@ export async function processCompletionsStream(
       output.usage = parseOpenAICompletionsUsage(usage, model, {
         includeReasoningTokens: !directMode,
       });
+      const terminalUsage = Boolean(
+        finishReason || choice?.finish_reason || chunk.choices?.length === 0,
+      );
+      const completeCounts = [usage.prompt_tokens, usage.completion_tokens].every(
+        (value) => typeof value === "number" && Number.isFinite(value) && value >= 0,
+      );
+      output.usage.usageReport = {
+        state: terminalUsage && completeCounts ? "available" : "unavailable",
+      };
     }
     const rawChoiceDelta = choice?.delta ?? choice?.message;
     if (!choice) {
@@ -619,8 +629,9 @@ export async function processCompletionsStream(
       });
     },
   });
+  output.usage.usageReport ??= { state: "unavailable" };
   if (
-    !output.usage.contextUsage &&
+    (!output.usage.contextUsage || output.usage.usageReport.state === "unavailable") &&
     !options?.signal?.aborted &&
     output.stopReason !== "error" &&
     output.stopReason !== "aborted"

@@ -106,7 +106,9 @@ export async function createServiceChildRelayAdapter(
           events.emitError(error, "stderr"),
         )
       : undefined;
-  child.stdin?.on("error", (error) => events.emitError(error, "stdin"));
+  if (!params.terminateOnHostLoss) {
+    child.stdin?.on("error", (error) => events.emitError(error, "stdin"));
+  }
 
   let state: AuthorityState = "starting";
   let commandPid: number | undefined;
@@ -451,8 +453,12 @@ export async function createServiceChildRelayAdapter(
         });
       }
     } else if (message.type === "startup-error") {
-      if (useWindowsJobAnchor || useLinuxSubreaper) {
-        startup.reject(new Error(message.error));
+      // A failed command never sends ready. Keep its live anchor's identity for
+      // the outside-group extinction join without converting it into kill authority.
+      anchorPid ??= message.anchorPid;
+      cleanupDeadline.begin();
+      if (useWindowsJobAnchor || anchorPid !== undefined) {
+        startup.reject(Object.assign(new Error(message.error), message.errorDetails));
       } else {
         loseIdentity(message.error);
       }
@@ -572,6 +578,7 @@ export async function createServiceChildRelayAdapter(
     env: params.env ? toStringEnv(params.env) : undefined,
     stdinMode: params.stdinMode,
     secretFd: params.secretInput?.fd,
+    terminateOnHostLoss: params.terminateOnHostLoss,
     controlFd,
     ...preparation.ownership,
     treeOwnership: useLinuxSubreaper ? "linux-subreaper" : undefined,
@@ -579,7 +586,19 @@ export async function createServiceChildRelayAdapter(
     ...(control ? { acknowledgeClosing: true as const } : {}),
     windowsShellCommand: params.windowsShellCommand,
   };
-  const stdin = createManagedChildStdin(child.stdin);
+  const stdin = createManagedChildStdin(
+    child.stdin,
+    params.terminateOnHostLoss
+      ? () => {
+          void sendControlMessage({ type: "stdin-end" }).then(
+            () => child.stdin?.end(),
+            (error: unknown) =>
+              loseIdentity(toErrorObject(error, "stdin EOF delivery failed").message),
+          );
+        }
+      : undefined,
+    params.terminateOnHostLoss ? (error) => events.emitError(error, "stdin") : undefined,
+  );
   params.abortSignal?.addEventListener("abort", onConstructionAbort, { once: true });
   const ready = (async () => {
     using delivery = preparation.transferSecretInput();
@@ -600,9 +619,9 @@ export async function createServiceChildRelayAdapter(
         secretDeliveryResult.status === "rejected" ? secretDeliveryResult.reason : undefined;
       // Preserve admission failure over the secret pipe it closes as a consequence.
       if (startupError !== undefined || secretDeliveryError !== undefined) {
-        if ((useWindowsJobAnchor || useLinuxSubreaper) && startupError !== undefined) {
+        if (startupError !== undefined) {
           await startupErrorAckDelivery;
-          await cleanup.completion.promise;
+          await cleanup.promise;
         }
         throw startupError ?? secretDeliveryError;
       }

@@ -5,6 +5,7 @@ import { evaluateControlUiContext } from "../test-helpers/control-ui-e2e-context
 import {
   controlUiBundledSettingsStorageKey,
   installMockGateway,
+  pauseVirtualClock,
   type MockGatewayControls,
   type MockGatewayRequest,
 } from "../test-helpers/control-ui-e2e.ts";
@@ -70,6 +71,7 @@ async function proxyReconnect(
   gateway: MockGatewayControls,
   whileDisconnected: () => Promise<void>,
 ): Promise<void> {
+  await pauseVirtualClock(page);
   const socketCountBefore = await gateway.getSocketCount();
   await gateway.closeLatest(1001, "proxy idle timeout");
   await gateway.setOnline(false);
@@ -82,10 +84,18 @@ async function proxyReconnect(
     .toBe("reconnecting");
   await whileDisconnected();
   expect(await gateway.getRequests("config.patch")).toHaveLength(0);
+  const retryDelay = await evaluateControlUiContext(
+    page,
+    ({ gateway: source }) => (source.snapshot.reconnectAt ?? Number.NaN) - Date.now(),
+  );
+  expect(retryDelay).toBeGreaterThan(0);
+  await page.clock.fastForward(retryDelay);
   await expect
     .poll(() => gateway.getSocketCount(), { timeout: 10_000 })
     .toBeGreaterThan(socketCountBefore);
+  expect(await gateway.getRequests("config.patch")).toHaveLength(0);
   await gateway.setOnline(true);
+  await page.clock.resume();
   await expect
     .poll(() =>
       page.evaluate(() => {
@@ -202,28 +212,34 @@ suite.define(() => {
         const textarea = page.locator(selector).first();
         await textarea.waitFor();
         await textarea.fill("Synthetic preference proof");
-        const reads = await page.evaluate(async (activeRoute) => {
-          const owner = document.querySelector(
-            activeRoute === "new" ? "openclaw-new-session-page" : "openclaw-chat-pane",
-          ) as HTMLElement & { requestUpdate(): void; updateComplete: Promise<unknown> };
-          const descriptor = Object.getOwnPropertyDescriptor(Storage.prototype, "getItem")!;
-          const keys: string[] = [];
-          Storage.prototype.getItem = function (key) {
-            if (/^openclaw\.control\.(settings|currentGateway|token)\./u.test(key)) {
-              keys.push(key);
+        const reads = await page.evaluate(
+          async ({ activeRoute, selector: textareaSelector }) => {
+            const owner = document.querySelector(
+              activeRoute === "new" ? "openclaw-new-session-page" : "openclaw-chat-pane",
+            ) as HTMLElement & { updateComplete: Promise<unknown> };
+            const input = document.querySelector<HTMLTextAreaElement>(textareaSelector)!;
+            const draft = input.value;
+            const descriptor = Object.getOwnPropertyDescriptor(Storage.prototype, "getItem")!;
+            const keys: string[] = [];
+            Storage.prototype.getItem = function (key) {
+              if (/^openclaw\.control\.(settings|currentGateway|token)\./u.test(key)) {
+                keys.push(key);
+              }
+              return Reflect.apply(descriptor.value, this, [key]);
+            };
+            try {
+              for (let index = 0; index < 10; index++) {
+                input.value = index % 2 === 0 ? `${draft} ` : draft;
+                input.dispatchEvent(new Event("input", { bubbles: true }));
+                await owner.updateComplete;
+              }
+              return keys;
+            } finally {
+              Object.defineProperty(Storage.prototype, "getItem", descriptor);
             }
-            return Reflect.apply(descriptor.value, this, [key]);
-          };
-          try {
-            for (let index = 0; index < 10; index++) {
-              owner.requestUpdate();
-              await owner.updateComplete;
-            }
-            return keys;
-          } finally {
-            Object.defineProperty(Storage.prototype, "getItem", descriptor);
-          }
-        }, route);
+          },
+          { activeRoute: route, selector },
+        );
         expect(reads).toEqual([]);
 
         const otherTab = await context.newPage();
@@ -312,6 +328,7 @@ suite.define(() => {
   it("replays an offline theme edit after a same-client reconnect", async () => {
     const context = await createContext();
     const page = await context.newPage();
+    await page.clock.install();
     const initial = configResponse({ theme: "claw", themeMode: "system" }, "prefs-a-1");
     const committed = configResponse(
       { theme: "knot", themeMode: "system", accent: "theme" },
@@ -364,6 +381,7 @@ suite.define(() => {
   it("keeps offline intent through read-only reconnect and dispatches once after authorization", async () => {
     const context = await createContext();
     const page = await context.newPage();
+    await page.clock.install();
     const initial = configResponse({ theme: "claw", themeMode: "system" }, "prefs-scope-1");
     const committed = configResponse(
       { theme: "knot", themeMode: "system", accent: "theme" },
@@ -414,6 +432,7 @@ suite.define(() => {
     const context = await createContext();
     const pageA = await context.newPage();
     const pageB = await context.newPage();
+    await pageA.clock.install();
     const initial = configResponse({ theme: "claw", themeMode: "system" }, "prefs-tabs-1");
     const gatewayA = await installMockGateway(pageA, {
       methodResponses: { "config.get": initial },
@@ -436,18 +455,22 @@ suite.define(() => {
         await gatewayB.setOperatorScopes(["operator.read"]);
       });
 
+      // Interacted tabs need foreground animation frames for click actionability.
+      await pageA.bringToFront();
       await proxyReconnect(pageA, gatewayA, async () => {
         await themeCard(pageA, "knot").click();
         await expectThemeActive(pageA, "knot");
         expect(await readPendingPrefStorage(pageA)).toEqual([
           { theme: "knot", accent: "theme", fontUi: null, fontChat: null },
         ]);
+        await pageB.bringToFront();
         await themeCard(pageB, "dash").click();
         await expectThemeActive(pageB, "dash");
         expect(await readPendingPrefStorage(pageB)).toEqual([]);
       });
       expect(await readPendingPrefStorage(pageA)).toEqual([]);
 
+      await pageA.bringToFront();
       await themeModeOption(pageA, "dark").click();
       const patch = await gatewayA.waitForRequest("config.patch");
       expect(patchPrefs(patch)).toEqual({ themeMode: "dark" });

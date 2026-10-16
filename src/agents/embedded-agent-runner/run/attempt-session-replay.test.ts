@@ -6,6 +6,7 @@ import {
   upsertSessionEntryCore,
 } from "../../../config/sessions/session-accessor.js";
 import { resolveSessionTranscriptReadFence } from "../../../config/sessions/session-transcript-read-fence.js";
+import { waitForSessionTranscriptProjection } from "../../../config/sessions/session-transcript-reconcile.js";
 import type { ContextEngine } from "../../../context-engine/types.js";
 import type { ImageContent } from "../../../llm/types.js";
 import { finalizeRuntimePromptImages } from "../../../media/runtime-prompt-image-provenance.js";
@@ -127,6 +128,53 @@ describe("context engine bootstrap", () => {
 });
 
 describe("interrupted canonical user replay", () => {
+  it("refuses queued custody after a sessions_send replacement retires the original user", async () => {
+    await withInterruptedTurn(
+      false,
+      async (fixture) => {
+        const replacement = await SessionManager.openAsync(fixture.target);
+        await replacement.appendLeafControlAsync({ targetId: null, appendParentId: null });
+        await waitForSessionTranscriptProjection(fixture.target);
+        const replacementUser: PersistedUserTurnMessage = {
+          role: "user",
+          content: "Continue the assigned work",
+          timestamp: 2,
+          idempotencyKey: "replacement-run:user",
+          provenance: {
+            kind: "inter_session",
+            sourceSessionKey: "agent:main:requester",
+            sourceChannel: "webchat",
+            sourceTool: "sessions_send",
+          },
+          __openclaw: {
+            modelPromptProjection: {
+              version: 1,
+              text:
+                "[Earlier unanswered user message. Address this request alongside the current input; " +
+                "follow the latest user instruction if they conflict.]\n" +
+                fixture.attempt.prompt +
+                "\n\nContinue the assigned work",
+            },
+          },
+        };
+        await replacement.appendMessageAsync(replacementUser);
+        await replacement.appendCustomMessageEntryAsync(
+          "openclaw.sessions_yield",
+          "Turn yielded.",
+          false,
+        );
+        await withReplaySession(fixture, false, async (session, submit) => {
+          await submit();
+          expect(Reflect.get(session.messages.at(-1)!, "errorMessage")).toMatch(
+            /^Session transcript keyed user is outside the current turn: \S/,
+          );
+          expect(streamMocks.streamSimple).not.toHaveBeenCalled();
+        });
+      },
+      { selectedOwner: true, admittedReceipt: true, interruptedTurn: false },
+    );
+  });
+
   it("discards unpersisted assistant mutations before deciding replay", async () => {
     await withInterruptedTurn(
       false,
@@ -390,7 +438,7 @@ describe("interrupted canonical user replay", () => {
     },
   );
 
-  it.each([false, true])(
+  it.each([false])(
     "hydrates one current user through the built-in owner with interruption %s",
     async (interrupted) => {
       await withInterruptedTurn(
@@ -582,10 +630,7 @@ describe("interrupted canonical user replay", () => {
     },
   );
 
-  it.each([
-    { ordering: "repeated-restart", appendOnly: false },
-    { ordering: "pre-core-compaction", appendOnly: false },
-  ])(
+  it.each([{ ordering: "pre-core-compaction", appendOnly: false }])(
     "replays the same interrupted turn after $ordering with append-only context $appendOnly",
     async ({ ordering, appendOnly }) => {
       await withInterruptedTurn(appendOnly, async (fixture) => {

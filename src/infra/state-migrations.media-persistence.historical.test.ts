@@ -25,8 +25,8 @@ import {
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import {
   completeGatewayBootLifecycle,
-  inspectGatewayCrashLoopBreaker,
-  recordGatewayBootStart,
+  inspectGatewayCrashLoopBreakerAsync,
+  beginGatewayBootLifecycle,
 } from "./gateway-boot-lifecycle.js";
 import * as nodeSqlite from "./node-sqlite.js";
 import { requireNodeSqlite } from "./node-sqlite.js";
@@ -186,9 +186,18 @@ it.each([
         );
         const retained = readRows(repaired);
         for (const key of ["windows", "events", "search"] as const) {
-          expect(retained[key]).toEqual(
-            original[key].filter((row) => row.session_id === "retained"),
-          );
+          const expected = [];
+          for (const row of original[key]) {
+            if (row.session_id !== "retained") {
+              continue;
+            }
+            expected.push(
+              key === "windows" && schemaVersion === 24
+                ? { ...row, row_transcript_json: null, row_transcript_updated_at: null }
+                : row,
+            );
+          }
+          expect(retained[key]).toEqual(expected);
         }
         expect(() => openOpenClawAgentDatabase(options)).not.toThrow();
       } else {
@@ -452,7 +461,11 @@ describe("legacy media persistence Doctor migration from historical schemas", ()
     try {
       const result = await scope.run(() => migrateLegacyMediaPersistence({ env }));
       expect(rejected).toBe(true);
-      expect(result.changes).toEqual([]);
+      expect(result.changes).toEqual([
+        expect.stringContaining(
+          `Saved pre-repair SQLite backup: ${path.join(path.dirname(databasePath), "openclaw-media-persistence-recovery-")}`,
+        ),
+      ]);
       expect(result.warnings).toEqual([
         expect.stringContaining("Recovery backup coverage is no longer current"),
       ]);
@@ -599,7 +612,7 @@ describe("media persistence gateway lifecycle recovery", () => {
 
     const nowMs = 1_000_000;
     for (let index = 0; index < 3; index += 1) {
-      const bootId = recordGatewayBootStart(env, nowMs + index);
+      const bootId = (await beginGatewayBootLifecycle(env, nowMs + index)).id;
       await completeGatewayBootLifecycle(
         bootId,
         {
@@ -611,7 +624,7 @@ describe("media persistence gateway lifecycle recovery", () => {
         nowMs + index + 1,
       );
     }
-    expect(inspectGatewayCrashLoopBreaker(env, nowMs + 4).tripped).toBe(false);
+    expect((await inspectGatewayCrashLoopBreakerAsync(env, nowMs + 4)).tripped).toBe(false);
 
     const result = await migrateLegacyMediaPersistence({ env });
 
@@ -623,7 +636,7 @@ describe("media persistence gateway lifecycle recovery", () => {
         )
         .get(),
     ).toMatchObject({ count: 3 });
-    expect(inspectGatewayCrashLoopBreaker(env, nowMs + 5)).toMatchObject({
+    expect(await inspectGatewayCrashLoopBreakerAsync(env, nowMs + 5)).toMatchObject({
       tripped: false,
       uncleanBoots: 0,
     });

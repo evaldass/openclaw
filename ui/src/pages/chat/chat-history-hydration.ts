@@ -39,7 +39,7 @@ import {
   applyHistoryRun,
 } from "./chat-history-stream.ts";
 import { applyChatPendingInputs } from "./chat-pending-inputs.ts";
-import { reconcileChatRunStartup } from "./chat-run-startup.ts";
+import { isChatRunRecoveryStatus, reconcileChatRunStartup } from "./chat-run-startup.ts";
 import type { ChatHistoryHost, ChatHistorySessions, ChatState } from "./chat-state-contract.ts";
 import {
   getChatSessionProjection,
@@ -48,11 +48,6 @@ import {
   publishChatSessionProjection,
   publishChatSessionProjectionMessages,
 } from "./history-merge.ts";
-import {
-  controlUiNowMs,
-  recordControlUiPerformanceEvent,
-  roundedControlUiDurationMs,
-} from "./performance.ts";
 import type { ChatHistoryRunObservation } from "./run-lifecycle.ts";
 import { applySessionMessagePayload } from "./session-message-apply.ts";
 import { retainPersistedStreamPrefix } from "./stream-causal-boundary.ts";
@@ -100,30 +95,8 @@ export async function hydrateChatHistory(
         }
       : undefined;
   };
-  const startedAtMs = controlUiNowMs();
   const previousRunProjections = readRunProjections(state, sessionKey, requestAgentId);
   const previousRunId = state.chatRunId;
-  const recordTiming = (
-    phase: "start" | "applied" | "stream-reset" | "stale" | "error",
-    extra: Record<string, unknown> = {},
-  ) =>
-    recordControlUiPerformanceEvent(
-      // SAFETY: real chat panes carry optional performance fields; minimal hosts may omit them.
-      state as ChatState & Parameters<typeof recordControlUiPerformanceEvent>[0],
-      "control-ui.chat.history",
-      {
-        phase,
-        durationMs: roundedControlUiDurationMs(controlUiNowMs() - startedAtMs),
-        sessionKey: state.sessionKey,
-        activeRunId: state.chatRunId,
-        requestSessionKey: sessionKey,
-        requestAgentId,
-        previousRunId,
-        ...extra,
-      },
-      { maxBufferedEventsForType: 30 },
-    );
-  recordTiming("start", { method });
   // Any pending input-history snapshot becomes invalid once we start reloading transcript state.
   state.resetChatInputHistoryNavigation?.();
   state.chatLoading = true;
@@ -180,18 +153,12 @@ export async function hydrateChatHistory(
     setChatError(state, null);
     let response = await request(deltaCursor);
     if (!isCurrent()) {
-      recordTiming("stale", {
-        reason: "apply-version",
-      });
       return undefined;
     }
     if (isHistoryCursor(response) && response.kind === "reset") {
       clearHistoryCursor(state, sessionKey, requestAgentId);
       response = await request();
       if (!isCurrent()) {
-        recordTiming("stale", {
-          reason: "reset-fallback-version",
-        });
         return undefined;
       }
     }
@@ -243,11 +210,6 @@ export async function hydrateChatHistory(
         resetStream: !state.chatRunId || state.chatRunId === previousRunId,
       });
       commitCurrentChatHistorySnapshot(state, response.deltaCursor ?? null, response.sessionInfo);
-      recordTiming("applied", {
-        messageCount: response.messages.length,
-        visibleMessageCount: response.messages.length,
-        resetStream: false,
-      });
       return {
         messages: state.chatMessages,
         deltaCursor: response.deltaCursor,
@@ -365,7 +327,7 @@ export async function hydrateChatHistory(
       if (
         state.chatRunId &&
         (hasVisibleStream || liveToolIds.length > 0) &&
-        !(state.chatRunStartup?.state === "status" && state.chatRunStartup.phase === "retrying")
+        !isChatRunRecoveryStatus(state.chatRunStartup)
       ) {
         reconcileChatRunStartup(state, { state: "activity", runId: state.chatRunId });
       }
@@ -390,10 +352,6 @@ export async function hydrateChatHistory(
           state.chatStream = null;
           state.chatStreamStartedAt = null;
         }
-        recordTiming("stream-reset", {
-          messageCount: messages.length,
-          visibleMessageCount: visibleMessages.length,
-        });
       } else if (!state.chatRunId) {
         publishChatSessionProjectionMessages(
           state,
@@ -435,20 +393,11 @@ export async function hydrateChatHistory(
       resetStream,
     });
 
-    recordTiming("applied", {
-      messageCount: messages.length,
-      visibleMessageCount: visibleMessages.length,
-      resetStream,
-    });
     return res;
   } catch (err) {
     if (!isCurrent()) {
-      recordTiming("stale", {
-        reason: "error-version",
-      });
       return undefined;
     }
-    recordTiming("error");
     const missingReadScope = isMissingOperatorReadScopeError(err);
     if (missingReadScope) {
       resetChatHistoryProjection(state, requestAgentId);

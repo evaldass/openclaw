@@ -108,6 +108,7 @@ export type EmbeddedAgentSubscribeState = {
     finalMessageStart: number;
     lastAssistant: AssistantMessage;
     keptAnswer?: CompletedAssistantAnswer;
+    sourceReplyDeliveryState?: ReplyDeliveryState;
   }>;
   /** Latest response-ending answer to the current input. */
   inputAnswer?: CompletedAssistantAnswer;
@@ -285,6 +286,7 @@ export type EmbeddedAgentSubscribeContext = {
     text: string,
     options?: { final?: boolean },
   ) => ReplyDirectiveParseResult | null;
+  getPartialReplySourceText: () => string;
   resetPartialReplyDirectives: () => void;
   resetAssistantMessageState: (nextAssistantTextBaseline: number) => void;
   resetForCompactionRetry: () => void;

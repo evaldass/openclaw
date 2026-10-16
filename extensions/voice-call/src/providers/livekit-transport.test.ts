@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
-import { VoiceCallConfigSchema } from "../config.js";
+import { normalizeVoiceCallConfig } from "../config.js";
 import { LiveKitProvider } from "./livekit.js";
 
 const clients = vi.hoisted(() => ({ rooms: vi.fn(), sip: vi.fn() }));
@@ -31,7 +31,7 @@ it.each([
   ["WSS://livekit.example.test:7880", false, "https://livekit.example.test:7880"],
   ["WS://10.0.0.1:7880", true, "http://10.0.0.1:7880"],
 ])("maps %s to the matching SDK API transport", async (url, allowInsecureWs, host) => {
-  const config = VoiceCallConfigSchema.parse({
+  const config = normalizeVoiceCallConfig({
     livekit: {
       url,
       allowInsecureWs,

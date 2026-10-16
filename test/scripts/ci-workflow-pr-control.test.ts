@@ -47,7 +47,55 @@ describe("PR failure reporting", () => {
           runnerProfile: "hybrid",
           failureReportOutputs: {},
         }),
-      ).toBe("blacksmith-4vcpu-ubuntu-2404");
+      ).toBe(runnerBackend === "hybrid" ? "ubuntu-24.04" : "blacksmith-4vcpu-ubuntu-2404");
+      const report = readCiWorkflow().jobs["pr-failure-report"];
+      expect(
+        evaluateWorkflowExpression(report["runs-on"], {
+          ...context,
+          runnerBackend,
+          runnerProfile: "hybrid",
+        }),
+      ).toBe(runnerBackend === "hybrid" ? "ubuntu-24.04" : "blacksmith-4vcpu-ubuntu-2404");
+      expect(
+        evaluateWorkflowExpression(report["runs-on"], {
+          ...context,
+          runnerBackend,
+          headRepository: "contributor/openclaw",
+        }),
+      ).toBe("ubuntu-24.04");
+    }
+  });
+
+  it("keeps hybrid qualification and release runner reservations intact", () => {
+    const workflow = readCiWorkflow();
+    for (const nodeRunnerBackend of ["hybrid", "runson"]) {
+      const context = {
+        eventName: "workflow_dispatch" as const,
+        repository: "openclaw/openclaw",
+        runAttempt: 1,
+        runnerBackend: "hybrid" as const,
+        preflightOutputs: {
+          ci_qualification: "true",
+          qualification_runner_backend: "hybrid",
+          node_runner_backend: nodeRunnerBackend,
+        },
+      };
+      expect(evaluateWorkflowExpression(workflow.jobs.preflight["runs-on"], context)).toBe(
+        "ubuntu-24.04",
+      );
+      expect(evaluateWorkflowExpression(workflow.jobs["ci-gate"]["runs-on"], context)).toBe(
+        "blacksmith-4vcpu-ubuntu-2404",
+      );
+      for (const jobName of ["preflight", "ci-gate"]) {
+        expect(
+          evaluateWorkflowExpression(workflow.jobs[jobName]["runs-on"], {
+            ...context,
+            preflightOutputs: {},
+            dispatchId: "full-release-validation-123-1",
+            releaseRunnerGroup: "Release reserved",
+          }),
+        ).toEqual({ group: "Release reserved", labels: "ubuntu-24.04" });
+      }
     }
   });
 
@@ -134,35 +182,15 @@ describe("PR failure reporting", () => {
     ).toBe(false);
   });
 
-  it.each(["pull_request", "push", "workflow_dispatch"] as const)(
-    "keeps canonical PR matrices complete and first-attempt diagnostic continuation (%s)",
-    (eventName) => {
-      const workflow = readCiWorkflow();
-      const node = workflow.jobs["checks-node-core-test-nondist-shard"];
-      const run = node.steps.find((step: WorkflowStep) => step.name === "Run Node test shard");
-      for (const [repository, headRepository, runAttempt, nativeFailFast, continuation] of [
-        ["openclaw/openclaw", "openclaw/openclaw", 1, false, "1"],
-        ["openclaw/openclaw", "contributor/openclaw", 1, false, "1"],
-        ["openclaw/openclaw", "openclaw/openclaw", 2, false, "0"],
-        ["openclaw/openclaw", "contributor/openclaw", 2, false, "0"],
-        ["openclaw/openclaw", "openclaw/openclaw", 3, false, "0"],
-        ["fork/openclaw", "fork/openclaw", 1, true, "0"],
-        ["fork/openclaw", "contributor/openclaw", 1, true, "0"],
-        ["fork/openclaw", "fork/openclaw", 2, true, "0"],
-      ] as const) {
-        const context = { eventName, repository, headRepository, runAttempt };
-        expect(evaluateWorkflowExpression(node.strategy["fail-fast"], context)).toBe(
-          eventName === "pull_request" && nativeFailFast,
-        );
-        expect(
-          evaluateWorkflowExpression(run.env.OPENCLAW_NODE_TEST_PLAN_CONTINUE_ON_FAILURE, context),
-        ).toBe(eventName === "pull_request" ? continuation : "0");
-      }
-    },
-  );
+  it("keeps every CI matrix row and removes first-attempt continuation gating", () => {
+    const node = readCiWorkflow().jobs["checks-node-core-test-nondist-shard"];
+    const run = node.steps.find((step: WorkflowStep) => step.name === "Run Node test shard");
+    expect(node.strategy["fail-fast"]).toBe(false);
+    expect(run.env).not.toHaveProperty("OPENCLAW_NODE_TEST_PLAN_CONTINUE_ON_FAILURE");
+  });
 
   it.skipIf(process.platform === "win32")(
-    "finishes selected compiler and lint groups only for ordinary diagnostic failures",
+    "finishes selected compiler and lint groups after every non-cancellation failure",
     () => {
       const workflow = readCiWorkflow();
       const central = workflow.jobs["check-shard"].steps.find(
@@ -178,6 +206,10 @@ describe("PR failure reporting", () => {
         new URL("../../scripts/ci-static-step.sh", import.meta.url),
         path.join(root, ".ci-harness/scripts/ci-static-step.sh"),
       );
+      copyFileSync(
+        new URL("../../scripts/ci-collect-checks.sh", import.meta.url),
+        path.join(root, ".ci-harness/scripts/ci-collect-checks.sh"),
+      );
       mkdirSync(path.join(root, "scripts"));
       writeFileSync(path.join(root, "scripts/run-oxlint-shards.mts"), "// --extension-stripe\n");
       writeFileSync(
@@ -187,8 +219,8 @@ describe("PR failure reporting", () => {
       );
       for (const [evidence, compilerExit, expectedCalls, groups] of [
         ["1", "2", 2, 2],
-        ["0", "2", 1, 0],
-        ["1", "1", 1, 0],
+        ["0", "2", 2, 2],
+        ["1", "1", 2, 2],
       ] as const) {
         writeFileSync(calls, "");
         const run = spawnSync("/bin/bash", ["-c", central.run], {
@@ -243,8 +275,8 @@ describe("PR failure reporting", () => {
       );
       for (const [evidence, compilerExit, expectedCalls, groups] of [
         ["1", "1", 2, 2],
-        ["0", "1", 1, 0],
-        ["1", "2", 1, 0],
+        ["0", "1", 2, 2],
+        ["1", "2", 2, 2],
       ] as const) {
         writeFileSync(calls, "");
         const lintRun = spawnSync("/bin/bash", ["-c", lintScript], {

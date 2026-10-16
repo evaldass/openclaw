@@ -16,6 +16,7 @@ import { defaultRuntime } from "../../runtime.js";
 import {
   createGatewayRestartDeadline,
   GatewayRestartDeadlineError,
+  type GatewayRestartDeadline,
 } from "../daemon-cli/restart-health-deadline.js";
 import {
   GATEWAY_RESTART_PROBE_TIMEOUT_MS,
@@ -50,6 +51,7 @@ export async function verifyPreviousGatewayForUpdate(params: {
   requirePluginHealth?: boolean;
   expectedVersion?: string;
   gatewayPort?: number;
+  waitForStartup?: boolean;
 }): Promise<boolean> {
   const { config, env } = params;
   const { assertCurrent, proofOptions } = captureUpdateGatewayReadinessOwner(params);
@@ -61,7 +63,9 @@ export async function verifyPreviousGatewayForUpdate(params: {
     previousGateway: true,
   });
   const startedAtMs = Date.now();
-  const deadline = createGatewayRestartDeadline({ timeoutMs, signal: params.signal });
+  const sharedDeadline = params.opts.run?.deadline;
+  const deadline =
+    sharedDeadline ?? createGatewayRestartDeadline({ timeoutMs, signal: params.signal });
   let lastProgress = { stage: "", at: -Infinity };
   let lastReason = "resolving the previous Gateway port and installed version";
   const progress = (stage: string, reason: string, warning = false) => {
@@ -112,27 +116,24 @@ export async function verifyPreviousGatewayForUpdate(params: {
         expectedBuildId: expectedBuildId ?? undefined,
         timeoutMs,
         probeTimeoutMs: 5_000,
-        deadlineMs: deadline.deadlineMs,
+        deadline,
         requireRunningService: true,
+        waitForStartup: params.waitForStartup,
         settle: { probes: 1 },
         signal: deadline.signal,
         requirePluginHealth: params.requirePluginHealth,
         assertCurrent,
         onProgress: progress,
       });
-      if (health.waitOutcome === "timeout" || health.waitOutcome === "still-starting") {
-        progress(health.waitOutcome, lastReason, true);
+      if (!health.healthy || !readyz) {
+        progress(health.waitOutcome ?? "unverified", health.probeError ?? lastReason, true);
         return false;
       }
       progress("installation", "checking service command ownership of the previous installation");
       const servesPreviousPackage = await gatewayServiceCommandUsesRoot({ root: params.root, env });
       assertCurrent();
       return Boolean(
-        expectedVersion &&
-        servesPreviousPackage === true &&
-        health.healthy &&
-        health.runtime.status === "running" &&
-        readyz,
+        expectedVersion && servesPreviousPackage === true && health.runtime.status === "running",
       );
     });
   } catch (error) {
@@ -142,7 +143,9 @@ export async function verifyPreviousGatewayForUpdate(params: {
     progress("budget exhausted", lastReason, true);
     return false;
   } finally {
-    deadline.dispose();
+    if (!sharedDeadline) {
+      deadline.dispose();
+    }
   }
 }
 
@@ -161,6 +164,7 @@ export function captureUpdateGatewayReadinessOwner(params: {
   };
   const assertCurrent = () => {
     params.signal?.throwIfAborted();
+    originalRun?.deadline?.signal.throwIfAborted();
     if (
       params.opts.run !== originalRun ||
       originalRun?.executorFence !== originalExecutor ||
@@ -187,6 +191,7 @@ export type UpdateGatewayReadinessParams = {
   timeoutMs?: number;
   probeTimeoutMs?: number;
   deadlineMs?: number;
+  deadline?: GatewayRestartDeadline;
   onProgress?: (stage: string, reason: string) => void;
   observedStartupMs?: number;
   expectedVersion?: string;
@@ -196,7 +201,7 @@ export type UpdateGatewayReadinessParams = {
   health?: GatewayRestartSnapshot;
   /** Installation observes native startup; final verification owns HTTP and identity proof. */
   healthOnly?: boolean;
-  /** A failure before activation observes existing health without waiting for startup. */
+  /** Observe an existing process without waiting for startup. */
   waitForStartup?: boolean;
   settle?: { probes: number };
   signal?: AbortSignal;
@@ -226,7 +231,6 @@ export function gatewayReadinessPending(health: GatewayRestartSnapshot): boolean
     !health.versionMismatch &&
     !health.buildIdMismatch &&
     !health.activatedPluginErrors?.length &&
-    !health.channelProbeErrors?.length &&
     health.staleGatewayPids.length === 0
   );
 }
@@ -244,13 +248,15 @@ export async function observeUpdateGatewayReadiness(params: UpdateGatewayReadine
     ? (Math.max(1, settle.probes) - 1) * DEFAULT_RESTART_HEALTH_DELAY_MS
     : 0;
   const startedAtMs = performance.now();
-  const deadline = createGatewayRestartDeadline({
-    timeoutMs: Math.max(
-      0,
-      Math.min(timeoutMs + settleDurationMs, (params.deadlineMs ?? Infinity) - startedAtMs),
-    ),
-    signal: params.signal,
-  });
+  const deadline =
+    params.deadline ??
+    createGatewayRestartDeadline({
+      timeoutMs: Math.max(
+        0,
+        Math.min(timeoutMs + settleDurationMs, (params.deadlineMs ?? Infinity) - startedAtMs),
+      ),
+      signal: params.signal,
+    });
   const remainingMs = deadline.remainingMs;
   const probeTimeoutMs = () =>
     waitForStartup && params.probeTimeoutMs === undefined
@@ -267,6 +273,7 @@ export async function observeUpdateGatewayReadiness(params: UpdateGatewayReadine
     expectedVersion: params.expectedVersion,
     ...(params.expectedBuildId ? { expectedBuildId: params.expectedBuildId } : {}),
     requirePluginHealth: params.requirePluginHealth ?? false,
+    requireChannelHealth: false,
     env: params.serviceEnv,
     signal: deadline.signal,
     deadline,
@@ -345,7 +352,6 @@ export async function observeUpdateGatewayReadiness(params: UpdateGatewayReadine
           health.versionMismatch ||
           health.buildIdMismatch ||
           health.activatedPluginErrors?.length ||
-          health.channelProbeErrors?.length ||
           health.staleGatewayPids.length > 0)
       ) {
         return { health, readyz: false, http: undefined, launchAgentRecovery };
@@ -461,6 +467,8 @@ export async function observeUpdateGatewayReadiness(params: UpdateGatewayReadine
       launchAgentRecovery,
     };
   } finally {
-    deadline.dispose();
+    if (!params.deadline) {
+      deadline.dispose();
+    }
   }
 }

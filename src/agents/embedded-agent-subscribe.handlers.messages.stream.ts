@@ -9,7 +9,10 @@ import {
   parseReplyDirectives,
   type ReplyDirectiveParseResult,
 } from "../auto-reply/reply/reply-directives.js";
-import { splitTrailingDirective } from "../auto-reply/reply/streaming-directives.js";
+import {
+  createStreamingDirectiveAccumulator,
+  splitTrailingDirective,
+} from "../auto-reply/reply/streaming-directives.js";
 import type { AssistantMessage } from "../llm/types.js";
 import {
   parseAssistantTextSignature,
@@ -185,7 +188,12 @@ export function emitAssistantCommentaryStreamData(
     }
   }
   for (const commentaryMessage of commentaryMessages) {
-    const text = extractAssistantCommentaryText(commentaryMessage);
+    const accumulator = createStreamingDirectiveAccumulator();
+    const text = extractAssistantCommentaryText(commentaryMessage, (part, final) => {
+      const preparedStart = accumulator.sourceText.length;
+      accumulator.consume(part, { final: finalMessage && final });
+      return accumulator.sourceText.slice(preparedStart);
+    });
     if (!text || (!finalMessage && isResponsesCommentary && ctx.state.deltaBuffer === text)) {
       continue;
     }
@@ -219,7 +227,7 @@ export function emitPersistentReasoning(ctx: EmbeddedAgentSubscribeContext, text
     !ctx.params.onBlockReply ||
     ctx.params.silentExpected ||
     shouldSuppressDeterministicApprovalOutput(ctx.state) ||
-    hasMessageToolOnlySourceDelivery(ctx) ||
+    shouldSuppressSourceReplyOutput(ctx) ||
     text === ctx.state.lastReasoningSent
   ) {
     return;
@@ -259,14 +267,15 @@ export function shouldSuppressDeterministicApprovalOutput(
   return state.deterministicApprovalPromptPending || state.deterministicApprovalPromptSent;
 }
 
-export function hasMessageToolOnlySourceDelivery(
+export function shouldSuppressSourceReplyOutput(
   ctx: Pick<EmbeddedAgentSubscribeContext, "params" | "state">,
 ): boolean {
   return (
-    ctx.params.sourceReplyDeliveryMode === "message_tool_only" &&
-    (ctx.state.messageToolOnlySourceReplyDelivered ||
-      ctx.params.hasDeliveredMessageToolOnlySourceReply?.() === true ||
-      (ctx.state.messagingToolSourceReplyPayloads?.length ?? 0) > 0)
+    ctx.state.sourceReplyDeliveryState === "delivered" ||
+    (ctx.params.sourceReplyDeliveryMode === "message_tool_only" &&
+      (ctx.state.messageToolOnlySourceReplyDelivered ||
+        ctx.params.hasDeliveredMessageToolOnlySourceReply?.() === true ||
+        (ctx.state.messagingToolSourceReplyPayloads?.length ?? 0) > 0))
   );
 }
 
@@ -343,7 +352,6 @@ export function resolveStreamingReply(params: {
   if (
     params.evtType !== "text_end" &&
     params.parsedStreamDirectives &&
-    !params.parsedStreamDirectives.isSilent &&
     !hasReplyDirectiveMetadata(params.parsedStreamDirectives) &&
     !/(?:^|\n)[^\S\n]*MEDIA:\s*\S[^\n]*(?:\n|$)/i.test(params.visibleDelta) &&
     params.parsedStreamDirectives.text === params.visibleDelta &&
@@ -366,7 +374,6 @@ export function resolveStreamingReply(params: {
     text === undefined &&
     params.evtType !== "text_end" &&
     params.parsedStreamDirectives &&
-    !params.parsedStreamDirectives.isSilent &&
     params.parsedStreamDirectives.text === params.visibleDelta &&
     params.appendDelta !== null &&
     params.previousCleaned &&
@@ -419,7 +426,6 @@ export function resolveStreamingReply(params: {
       params.appendDelta !== null &&
       source === params.rawDirectiveSource &&
       text === params.next &&
-      !parsed.isSilent &&
       !hasReplyDirectiveMetadata(parsed) &&
       !parsed.mediaUrls?.length
     ) {

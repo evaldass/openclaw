@@ -255,7 +255,7 @@ async function readRestorableVersion(
       }
       // Restored files must stay addressable by view/patch, which use the canonical path.
       if (canonical !== filePath) {
-        throw refuse(`${filePath} is not a canonical skill file path.`);
+        throw refuse(`${filePath} is not a valid skill file path.`);
       }
     }
     let content: Buffer;
@@ -669,6 +669,8 @@ export async function restoreWorkshopSkill(
         }
         throw error;
       }
+      // Only successful publication may discard the original live copy.
+      await fs.rm(previous, { recursive: true, force: true });
       const summary =
         params.summary ??
         (target.action === "archive"
@@ -679,7 +681,6 @@ export async function restoreWorkshopSkill(
       return { summary, versionId };
     } finally {
       await fs.rm(staging, { recursive: true, force: true });
-      await fs.rm(previous, { recursive: true, force: true });
     }
   });
 }

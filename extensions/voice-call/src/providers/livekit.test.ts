@@ -15,7 +15,6 @@ import {
 } from "openclaw/plugin-sdk/realtime-voice";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  VoiceCallConfigSchema,
   validateProviderConfig,
   normalizeVoiceCallConfig,
 } from "../config.js";
@@ -140,7 +139,7 @@ async function harness(
     ),
   };
   const provider = new LiveKitProvider(server, { rooms, sip, receiver, connectAudio });
-  const config = VoiceCallConfigSchema.parse({
+  const config = normalizeVoiceCallConfig({
     enabled: true,
     agentId: "main",
     provider: "livekit",
@@ -517,7 +516,7 @@ it("uses SDK signature and body digest verification, expiring room-scoped microp
 });
 
 it("requires signed webhooks, valid server URL, and realtime audio", () => {
-  const config = VoiceCallConfigSchema.parse({
+  const config = normalizeVoiceCallConfig({
     enabled: true,
     provider: "livekit",
     livekit,
@@ -526,7 +525,7 @@ it("requires signed webhooks, valid server URL, and realtime audio", () => {
   });
   expect(validateProviderConfig(config).errors).toContain("LiveKit requires realtime.enabled");
   expect(() =>
-    VoiceCallConfigSchema.parse({ livekit: { ...livekit, url: "http://insecure.test" } }),
+    normalizeVoiceCallConfig({ livekit: { ...livekit, url: "http://insecure.test" } }),
   ).toThrow();
 });
 

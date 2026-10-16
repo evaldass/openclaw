@@ -64,7 +64,7 @@ function requireSupportedSettings(value: unknown, scope: SettingsScope): Setting
     throw createInvalidConfigError(
       `${scope} session settings.json`,
       `Retired session settings: ${retired.join("; ")}. ` +
-        "Preserve the original file and replace the retired forms while retaining existing canonical values before retrying. " +
+        "Preserve the original file and replace the retired forms while retaining values that already use the current forms before retrying. " +
         "For a staged upgrade, OpenClaw 2026.9.7 retains the former settings reader. " +
         "See https://docs.openclaw.ai/gateway/doctor/config-migrations#session-settings.",
       { recovery: "manual" },
@@ -110,7 +110,7 @@ export class SettingsManager {
 
   static inMemory(settings: Partial<Settings> = {}): SettingsManager {
     const storage = new InMemorySettingsStorage();
-    const initialSettings = requireSupportedSettings(structuredClone(settings), "global");
+    const initialSettings = requireSupportedSettings(settings, "global");
     storage.withLock("global", () => JSON.stringify(initialSettings, null, 2));
     return SettingsManager.fromStorage(storage);
   }

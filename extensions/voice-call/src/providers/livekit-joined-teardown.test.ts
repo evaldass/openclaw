@@ -7,7 +7,7 @@ import {
   type RealtimeVoiceProviderPlugin,
 } from "openclaw/plugin-sdk/realtime-voice";
 import { expect, it, vi } from "vitest";
-import { VoiceCallConfigSchema } from "../config.js";
+import { normalizeVoiceCallConfig } from "../config.js";
 import { CallManager } from "../manager.js";
 import {
   createTestStorePath,
@@ -115,7 +115,7 @@ async function fixture(
 ) {
   rtc.disconnect.mockClear();
   rtc.sourceClose.mockClear();
-  const config = VoiceCallConfigSchema.parse({
+  const config = normalizeVoiceCallConfig({
     enabled: true,
     provider: "livekit",
     fromNumber: "+15550000001",

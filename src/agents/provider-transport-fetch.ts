@@ -15,8 +15,10 @@ import {
 } from "../infra/net/fetch-guard.js";
 import { wrapGuardedBodyStream } from "../infra/net/guarded-body-stream.js";
 import { shouldUseEnvHttpProxyForUrl } from "../infra/net/proxy-env.js";
+import { formatModelTransportContext } from "../llm/model-transport-context.js";
 import type { Model } from "../llm/types.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { getProviderAuthAuthority } from "../plugins/provider-auth-authority.js";
 import { resolveDebugProxySettings } from "../proxy-capture/env.js";
 import { isRetryableProviderHttpStatus } from "./failover/retry-evidence.js";
 import {
@@ -203,7 +205,7 @@ function shouldBypassLongSdkRetry(response: Response): boolean {
     return false;
   }
 
-  const retryAfterSeconds = parseRetryAfterSeconds(response.headers);
+  const retryAfterSeconds = parseRetryAfterSeconds(response.headers, Date.now(), status);
   if (retryAfterSeconds !== undefined) {
     return retryAfterSeconds > maxWaitSeconds;
   }
@@ -281,10 +283,13 @@ export function buildGuardedModelFetch(
   timeoutMs?: number,
   options?: { sanitizeSse?: boolean; onSseComment?: () => void },
 ): typeof fetch {
+  const assertAuthCurrent = getProviderAuthAuthority(model);
   const requestConfig = resolveModelRequestPolicy(model);
   const dispatcherPolicy = buildProviderRequestDispatcherPolicy(requestConfig);
   const requestTimeoutMs = resolveModelRequestTimeoutMs(model, timeoutMs);
   return async (input, init) => {
+    assertAuthCurrent?.();
+    const diagnosticContext = formatModelTransportContext();
     let localServiceLease: ProviderLocalServiceLease | undefined;
     const request = input instanceof Request ? new Request(input, init) : undefined;
     const rawUrl =
@@ -347,6 +352,8 @@ export function buildGuardedModelFetch(
       // Provider transport intentionally keeps the secure default and never
       // replays unsafe request bodies across cross-origin redirects.
       allowCrossOriginUnsafeRedirectReplay: false,
+      // Local service preparation, DNS and capture admission may outlive the credential owner.
+      beforeRequest: assertAuthCurrent,
       ...(policy ? { policy } : {}),
     };
     let result: Awaited<ReturnType<typeof fetchWithSsrFGuard>>;
@@ -358,7 +365,7 @@ export function buildGuardedModelFetch(
         // Log the pre-swap URL: the swapped URL can carry an injected credential in its path.
         `method=${baseInit?.method ?? "GET"} url=${formatModelTransportDebugUrl(rawUrl)} timeoutMs=${requestTimeoutMs} ` +
         `proxy=${dispatcherPolicy ? "configured" : useEnvProxy ? "env" : "none"} ` +
-        `policy=${policy ? "custom" : "default"}`,
+        `policy=${policy ? "custom" : "default"}${diagnosticContext}`,
     );
     try {
       localServiceLease = await ensureModelProviderLocalService(
@@ -381,7 +388,7 @@ export function buildGuardedModelFetch(
         log,
         "model-fetch",
         `provider=${model.provider} api=${model.api} model=${model.id} ` +
-          `elapsedMs=${Date.now() - fetchStartedAt} ${summarizeProviderTransportError(remediatedError)}`,
+          `elapsedMs=${Date.now() - fetchStartedAt} ${summarizeProviderTransportError(remediatedError)}${diagnosticContext}`,
         baseSignal,
       );
       localServiceLease?.release();
@@ -393,7 +400,8 @@ export function buildGuardedModelFetch(
       `[model-fetch] response provider=${model.provider} api=${model.api} model=${model.id} ` +
       `status=${response.status} elapsedMs=${elapsedMs} ` +
       `dispatcher=${result.dispatcherReused ? "reused" : "new"} ` +
-      `contentType=${response.headers.get("content-type") ?? ""}`;
+      `contentType=${response.headers.get("content-type") ?? ""} ` +
+      `httpRequestId=${response.headers.get("x-request-id") ?? "unknown"}${diagnosticContext}`;
     if (!response.ok) {
       log.info(responseMessage);
     } else {
